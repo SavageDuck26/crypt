@@ -27,8 +27,14 @@ const CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 const SALT_SIZE: usize = 32; // 256-bit Argon2id salt
 const NONCE_SIZE: usize = 12; // 96-bit AES-GCM nonce
 
+// The "catacomb": an authenticated end-of-stream trailer (v4+) recording the total
+// chunk count, so truncation at a chunk boundary is detectable. The marker is never
+// a valid chunk length (chunks are <= CHUNK_SIZE), so it can't be a real chunk.
+const CATACOMB_MARKER: u32 = 0xFFFF_FFFF;
+const CATACOMB_AAD: &[u8] = b"CRPT-catacomb";
+
 const CRYPT_MAGIC: &[u8; 4] = b"CRPT";
-const CRYPT_VERSION: u16 = 3; // v3 protects the header with built-in KDF params, data params hidden inside it
+const CRYPT_VERSION: u16 = 4; // v4 adds the catacomb (authenticated end-of-stream trailer) to detect truncation
 
 // Default worker threads 
 const DEFAULT_NUM_WORKERS: usize = 4;
@@ -1095,7 +1101,11 @@ fn main() -> std::io::Result<()> {
                 eprintln!("[WARN] {} out-of-order chunks could not be written (gaps in sequence).", pending.len());
             }
 
-            output_file.write_all(&0u32.to_le_bytes())?;
+            // Seal the stream with the catacomb: an authenticated trailer holding the
+            // total chunk count, so truncation at a chunk boundary is detectable.
+            output_file.write_all(&CATACOMB_MARKER.to_le_bytes())?;
+            let catacomb = aes_encrypt(&total_chunks.to_le_bytes(), key.as_ref(), CATACOMB_AAD)?;
+            output_file.write_all(&catacomb)?;
             output_file.flush()?;
             drop(output_file);
 
@@ -1266,36 +1276,61 @@ fn main() -> std::io::Result<()> {
                     }
                 });
 
+                let key_r = Arc::clone(&key_thread);
+                let legacy_trailer_ok = version < 4;
                 let chunk_reader_handle = thread::spawn(move || -> std::io::Result<()> {
                     use std::io::Seek;
                     let mut crypt_file = File::open(&crypt_path)?;
                     crypt_file.seek(std::io::SeekFrom::Start(header_skip))?;
                     let mut chunk_reader = BufReader::with_capacity(8 * 1024 * 1024, crypt_file);
                     let mut chunk_index: u64 = 0;
-                    let mut found_sentinel = false;
 
                     loop {
                         let mut pt_len_bytes = [0u8; 4];
                         match chunk_reader.read_exact(&mut pt_len_bytes) {
                             Ok(()) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                                if !found_sentinel {
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::UnexpectedEof,
-                                        "File truncated: missing end-of-chunks sentinel (0u32 trailer). Data may be incomplete.",
-                                    ));
-                                }
-                                break;
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "File truncated: missing the catacomb (end-of-stream trailer). Data may be incomplete.",
+                                ));
                             }
                             Err(e) => return Err(e),
                         }
-                        let pt_len = u32::from_le_bytes(pt_len_bytes) as usize;
+                        let pt_len = u32::from_le_bytes(pt_len_bytes);
+
+                        if pt_len == CATACOMB_MARKER {
+                            // The catacomb: verify the recorded total chunk count so a
+                            // file cut at a chunk boundary is detected as truncated.
+                            let mut catacomb = [0u8; 12 + 8 + 16];
+                            chunk_reader.read_exact(&mut catacomb)?;
+                            let count_bytes = aes_decrypt(&catacomb, &**key_r, CATACOMB_AAD).map_err(|_| {
+                                std::io::Error::new(std::io::ErrorKind::InvalidData,
+                                    "Catacomb (end-of-stream trailer) failed authentication — truncated or tampered file.")
+                            })?;
+                            if count_bytes.len() != 8 {
+                                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                                    "Catacomb (end-of-stream trailer) has an unexpected size."));
+                            }
+                            let mut count = [0u8; 8];
+                            count.copy_from_slice(&count_bytes);
+                            let expected = u64::from_le_bytes(count);
+                            if expected != chunk_index {
+                                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                                    format!("File truncated: catacomb declares {} chunk(s) but only {} were read.", expected, chunk_index)));
+                            }
+                            break;
+                        }
                         if pt_len == 0 {
-                            found_sentinel = true;
+                            // Legacy (v1-v3) unauthenticated 0u32 trailer — no catacomb.
+                            if !legacy_trailer_ok {
+                                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                                    "File truncated: expected an authenticated catacomb (end-of-stream trailer)."));
+                            }
                             break;
                         }
 
-                        let chunk_len = 12 + pt_len + 16;
+                        let chunk_len = 12 + pt_len as usize + 16;
                         let mut chunk_data = vec![0u8; chunk_len];
                         chunk_reader.read_exact(&mut chunk_data)?;
 
