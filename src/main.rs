@@ -82,6 +82,7 @@ impl Default for Config {
 const DEFAULT_CONFIG_TOML: &str = r#"# IMPORTANT NOTES:
 # Crypt only takes ASCII passwords.
 # Use a password over at least 8 characters.
+# CryptConfig must be in the same directory as Crypt.
 
 # Worker threads. Overridden by the --workers <n> CLI flag.
 # Going over CPU cores will slow down progress.
