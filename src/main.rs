@@ -28,10 +28,10 @@ const SALT_SIZE: usize = 32; // 256-bit Argon2id salt
 const NONCE_SIZE: usize = 12; // 96-bit AES-GCM nonce
 
 const CRYPT_MAGIC: &[u8; 4] = b"CRPT";
-const CRYPT_VERSION: u16 = 1;
+const CRYPT_VERSION: u16 = 3; // v3 protects the header with built-in KDF params, data params hidden inside it
 
 // Default worker threads 
-const DEFAULT_NUM_WORKERS: usize = 2;
+const DEFAULT_NUM_WORKERS: usize = 4;
 
 // Default Argon2id parameters 
 const DEFAULT_ARGON2_MEM_COST: u32 = 524288;     // 512 MB
@@ -39,9 +39,25 @@ const DEFAULT_ARGON2_TIME_COST: u32 = 12;
 const DEFAULT_ARGON2_PARALLELISM: u32 = 2;
 
 const DEFAULT_ZSTD_COMPRESSION_LEVEL: i32 = 22;
+const MIN_ZSTD_LEVEL: i32 = 1;
+const MAX_ZSTD_LEVEL: i32 = 22;
 
-// JSON config read from CryptConfig.json alongside the binary.
+// The header is ALWAYS encrypted with these built-in ("solid-state") Argon2id
+// params, independent of the user's config, so its metadata stays protected by
+// strong defaults. They are NOT stored in the file, so they must never change.
+const HEADER_ARGON2_MEM_COST: u32 = 524288; // 512 MiB
+const HEADER_ARGON2_TIME_COST: u32 = 12;
+const HEADER_ARGON2_PARALLELISM: u32 = 2;
+
+// Bounds accepted for KDF params read back from a file (DoS guard against tampered headers).
+const MIN_ARGON2_MEM_COST: u32 = 8;
+const MAX_ARGON2_MEM_COST: u32 = 4 * 1024 * 1024; // 4 GiB, in KiB
+const MAX_ARGON2_TIME_COST: u32 = 4096;
+const MAX_ARGON2_PARALLELISM: u32 = 256;
+
+// TOML config, read from CryptConfig.toml next to the binary (TOML so it can hold comments).
 #[derive(Serialize, Deserialize)]
+#[serde(default)]
 struct Config {
     num_workers: usize,
     argon2_mem_cost: u32,
@@ -62,26 +78,61 @@ impl Default for Config {
     }
 }
 
+// Default config written on first run. Values mirror `Config::default()`.
+const DEFAULT_CONFIG_TOML: &str = r#"# IMPORTANT NOTES:
+# Crypt only takes ASCII passwords.
+# Use a password over at least 8 characters.
+
+# Worker threads. Overridden by the --workers <n> CLI flag.
+# Going over CPU cores will slow down progress.
+num_workers = 4
+
+# Argon2id parameters (mem cost in KiB; 524288 = 512 MiB).
+# Already on strong settings, higher is better. No CLI flag.
+argon2_mem_cost = 524288
+argon2_time_cost = 12
+argon2_parallelism = 2
+
+# Zstd compression level (1-22), 19+ is recommended.
+# --level <n> CLI flag. n>22 = 22.
+zstd_compression_level = 22
+
+
+# Encrypt Example:
+# Crypt -e "/crazystuff", "/otherstuff/coolstuff" --output "/externaldrive" --workers 10 --level 20
+
+# Crypt -e -> invokes binary in encryption mode.
+# "/crazystuff", "/otherstuff/coolstuff" -> paths to encrypt, comma separated.
+# --output "/externaldrive" -> where to save the .crypt file.
+# --workers 10 -> how many threads to work with.
+# --level 20 -> Zstd level.
+
+# Decrypt Example:
+# Crypt -d "/externaldrive/crazystuff.crypt", "/externaldrive/coolstuff.crypt" --output "/restored" --workers 10
+
+# Crypt -d -> invokes binary in decryption mode.
+# "/externaldrive/crazystuff.crypt", "/externaldrive/coolstuff.crypt" -> .crypt files to decrypt, comma separated.
+# --output "/restored" -> where to save the decrypted files.
+"#;
 
 fn load_config() -> Config {
     let config_path = {
         let exe = env::current_exe().expect("Failed to get executable path");
         let dir = exe.parent().expect("Failed to get executable directory");
-        dir.join("CryptConfig.json")
+        dir.join("CryptConfig.toml")
     };
 
     if !config_path.exists() {
-        let config = Config::default();
-        let json = serde_json::to_string_pretty(&config)
-            .expect("Failed to serialize default config");
-        fs::write(&config_path, json).expect("Failed to write default config");
+        fs::write(&config_path, DEFAULT_CONFIG_TOML)
+            .expect("Failed to write default config");
         println!("Created default config: {}", config_path.display());
-        return config;
+        // Parse what we just wrote so the file and defaults stay in sync.
+        return toml::from_str(DEFAULT_CONFIG_TOML).unwrap_or_default();
     }
 
-    let json = fs::read_to_string(&config_path)
+    let toml_str = fs::read_to_string(&config_path)
         .expect("Failed to read config file");
-    serde_json::from_str(&json)
+    toml::from_str(&toml_str)
         .unwrap_or_else(|e| {
             eprintln!("[WARN] Failed to parse config '{}', using defaults: {}", config_path.display(), e);
             Config::default()
@@ -129,35 +180,75 @@ fn sanitize_path_component(component: &str) -> String {
         .collect()
 }
 
-// Extract a tar archive, sanitizing each path to be exFAT-safe.
-fn unpack_tar_sanitized<R: Read>(archive: &mut tar::Archive<R>, base_path: &Path) -> std::io::Result<()> {
+// Return `name`, or `name_1` / `name_2` / … if `base/name` already exists.
+fn unique_component(base: &Path, name: &str) -> String {
+    if !base.join(name).exists() {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && !e.is_empty() => (s.to_string(), Some(e.to_string())),
+        _ => (name.to_string(), None),
+    };
+    let mut n = 1u32;
+    loop {
+        let candidate = match &ext {
+            Some(e) => format!("{}_{}.{}", stem, n, e),
+            None => format!("{}_{}", stem, n),
+        };
+        if !base.join(&candidate).exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+// Extract a tar archive, sanitizing each path to be exFAT-safe and giving any
+// colliding top-level name a `_n` suffix. Returns the resolved top-level names.
+fn unpack_tar_sanitized<R: Read>(archive: &mut tar::Archive<R>, base_path: &Path) -> std::io::Result<Vec<String>> {
+    let mut resolved: HashMap<String, String> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
         let entry_path = entry.path()?.to_string_lossy().to_string();
 
-        let sanitized: Vec<String> = entry_path.split('/')
+        let mut sanitized: Vec<String> = entry_path.split('/')
             .map(sanitize_path_component)
             .collect();
-        let sanitized_path = sanitized.join("/");
 
         if sanitized.iter().any(|c| c == ".." || c == ".") {
-            eprintln!("[WARN] Skipping entry with path traversal: '{}'", sanitized_path);
+            eprintln!("[WARN] Skipping entry with path traversal: '{}'", sanitized.join("/"));
+            continue;
+        }
+        if sanitized.first().map_or(true, |c| c.is_empty()) {
             continue;
         }
 
-        let full_path = base_path.join(&sanitized_path);
+        // Resolve the top-level component so an existing file/dir is never clobbered.
+        let top = sanitized[0].clone();
+        let mapped = match resolved.get(&top) {
+            Some(name) => name.clone(),
+            None => {
+                let name = unique_component(base_path, &top);
+                resolved.insert(top, name.clone());
+                order.push(name.clone());
+                name
+            }
+        };
+        sanitized[0] = mapped;
 
+        let full_path = base_path.join(sanitized.join("/"));
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent)?;
         }
-
         if entry.header().entry_type().is_dir() {
             fs::create_dir_all(&full_path)?;
         } else {
             entry.unpack(&full_path)?;
         }
     }
-    Ok(())
+
+    Ok(order)
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -174,6 +265,16 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 // Read a password with masked echo (`*` per keystroke).
+// Clear the entered password and erase its '*'s from the screen.
+fn clear_masked_input(password: &mut String) {
+    let len = password.len();
+    password.clear();
+    for _ in 0..len {
+        print!("\x08 \x08");
+    }
+    std::io::stdout().flush().ok();
+}
+
 fn get_password() -> Zeroizing<String> {
     println!("Enter password.");
 
@@ -221,14 +322,7 @@ fn get_password() -> Zeroizing<String> {
                     std::io::stdout().flush().ok();
                 }
             }
-            0x15 => {
-                let len = password.len();
-                password.clear();
-                for _ in 0..len {
-                    print!("\x08 \x08");
-                }
-                std::io::stdout().flush().ok();
-            }
+            0x15 => clear_masked_input(&mut password),
             0x03 => {
                 println!("^C");
                 std::process::exit(130);
@@ -241,6 +335,10 @@ fn get_password() -> Zeroizing<String> {
                 password.push(byte[0] as char);
                 print!("*");
                 std::io::stdout().flush().ok();
+            }
+            0x80..=0xFF => {
+                clear_masked_input(&mut password);
+                eprintln!("[WARN] Non-ASCII password, disallowed.");
             }
             _ => {}
         }
@@ -283,7 +381,7 @@ fn get_input_paths() -> Vec<PathBuf> {
         if trimmed.is_empty() { continue; }
         let path = PathBuf::from(&trimmed);
         if path.exists() { paths.push(path); println!("Added: {}", trimmed); }
-        else { println!("Path does not exist: {}. Skipping.", trimmed); }
+        else { eprintln!("[WARN] Path does not exist: {}. Skipping.", trimmed); }
     }
     if paths.is_empty() { println!("No valid paths entered."); }
     paths
@@ -313,9 +411,25 @@ fn get_output_dir() -> Option<PathBuf> {
         println!("Output directory: {}", path.display());
         Some(path)
     } else {
-        println!("Path '{}' is not a valid directory. Using default (source file's directory).", trimmed);
+        eprintln!("[WARN] Path '{}' is not a valid directory. Using default (source file's directory).", trimmed);
         None
     }
+}
+
+// Make sure a `--output` directory exists, creating it if necessary.
+fn ensure_output_dir(dir: &Path) {
+    if dir.is_dir() {
+        return;
+    }
+    if dir.exists() {
+        eprintln!("Error: output path '{}' exists but is not a directory.", dir.display());
+        std::process::exit(1);
+    }
+    if let Err(e) = fs::create_dir_all(dir) {
+        eprintln!("Error: cannot create output directory '{}': {}", dir.display(), e);
+        std::process::exit(1);
+    }
+    eprintln!("[WARN] Output not present, creating folder for output: {:?}", dir);
 }
 
 fn make_salt() -> Zeroizing<[u8; SALT_SIZE]> {
@@ -330,12 +444,27 @@ fn build_argon2(mem_cost: u32, time_cost: u32, parallelism: u32) -> Argon2<'stat
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
-fn derive_key(password: &str, salt: &[u8; SALT_SIZE], config: &Config) -> Zeroizing<[u8; 32]> {
+fn derive_key(password: &str, salt: &[u8; SALT_SIZE], mem_cost: u32, time_cost: u32, parallelism: u32) -> Zeroizing<[u8; 32]> {
     let mut key = Zeroizing::new([0u8; 32]);
-    build_argon2(config.argon2_mem_cost, config.argon2_time_cost, config.argon2_parallelism)
+    build_argon2(mem_cost, time_cost, parallelism)
         .hash_password_into(password.as_bytes(), salt, &mut *key)
         .expect("key derivation failed");
     key
+}
+
+// Reject absurd KDF params read from a file so a tampered header cannot exhaust
+// memory/CPU before the wrong key is detected.
+fn validate_kdf_params(mem_cost: u32, time_cost: u32, parallelism: u32) -> Result<(), String> {
+    if mem_cost < MIN_ARGON2_MEM_COST || mem_cost > MAX_ARGON2_MEM_COST {
+        return Err(format!("mem_cost {} out of range ({}..={} KiB)", mem_cost, MIN_ARGON2_MEM_COST, MAX_ARGON2_MEM_COST));
+    }
+    if time_cost < 1 || time_cost > MAX_ARGON2_TIME_COST {
+        return Err(format!("time_cost {} out of range (1..={})", time_cost, MAX_ARGON2_TIME_COST));
+    }
+    if parallelism < 1 || parallelism > MAX_ARGON2_PARALLELISM {
+        return Err(format!("parallelism {} out of range (1..={})", parallelism, MAX_ARGON2_PARALLELISM));
+    }
+    Ok(())
 }
 
 fn aes_encrypt(data: &[u8], key: &[u8], aad: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -393,10 +522,24 @@ fn walkdir_and_add_to_tar<W: Write>(
             Ok(m) => m,
             Err(_) => { skipped += 1; continue; }
         };
-        if ft.is_dir() { continue; }
-        if !ft.is_file() { skipped += 1; continue; }
         let relative = entry.path().strip_prefix(source_dir).unwrap_or(entry.path());
-        let archive_entry = archive_name.join(relative);
+        let archive_entry = if relative.as_os_str().is_empty() {
+            archive_name.to_path_buf()
+        } else {
+            archive_name.join(relative)
+        };
+
+        // Record directory entries too, so empty directories survive a round-trip.
+        if ft.is_dir() {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_mtime(0);
+            header.set_mode(0o755);
+            tar_builder.append_data(&mut header, &archive_entry, std::io::empty())?;
+            continue;
+        }
+        if !ft.is_file() { skipped += 1; continue; }
 
         // Stream the file via BufReader instead of loading it entirely into RAM
         // (a 500 MB file would otherwise allocate that much memory).
@@ -456,10 +599,13 @@ fn decompress_frame(data: &[u8]) -> std::io::Result<Vec<u8>> {
 
 fn write_crypt_header(
     output_file: &mut BufWriter<File>,
-    key: &[u8],
+    header_key: &[u8],
     salt: &[u8],
     is_directory: bool,
     archive_name: &str,
+    argon2_mem_cost: u32,
+    argon2_time_cost: u32,
+    argon2_parallelism: u32,
 ) -> std::io::Result<()> {
     output_file.write_all(CRYPT_MAGIC)?;
     output_file.write_all(&CRYPT_VERSION.to_le_bytes())?;
@@ -472,13 +618,18 @@ fn write_crypt_header(
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Filename too long (max 65535 bytes)"));
     }
 
-    let mut header_plaintext = Vec::with_capacity(1 + 2 + name_len);
+    // The data KDF params travel INSIDE the encrypted header so they stay hidden
+    // yet recoverable even if the user changes the config later.
+    let mut header_plaintext = Vec::with_capacity(1 + 2 + name_len + 12);
     header_plaintext.push(type_byte);
     header_plaintext.extend_from_slice(&(name_len as u16).to_le_bytes());
     header_plaintext.extend_from_slice(name_bytes);
+    header_plaintext.extend_from_slice(&argon2_mem_cost.to_le_bytes());
+    header_plaintext.extend_from_slice(&argon2_time_cost.to_le_bytes());
+    header_plaintext.extend_from_slice(&argon2_parallelism.to_le_bytes());
 
     // Header gets no AAD — it's metadata, not a data-bearing chunk.
-    let encrypted_header = aes_encrypt(&header_plaintext, key, &[])?;
+    let encrypted_header = aes_encrypt(&header_plaintext, header_key, &[])?;
     let header_total_len = encrypted_header.len() as u16;
     output_file.write_all(&header_total_len.to_le_bytes())?;
     output_file.write_all(&encrypted_header)?;
@@ -519,15 +670,170 @@ fn chunk_aad(index: u64) -> Vec<u8> {
     index.to_le_bytes().to_vec()
 }
 
+// CLI: positional paths (comma-separated when more than one), an operation flag
+// (-e/-E to encrypt, -d/-D to decrypt), `--workers <N>`, `--level <n>` and `--output <dir>`.
+struct CliArgs {
+    paths: Vec<PathBuf>,
+    workers: Option<usize>,
+    operation: Option<char>,
+    output: Option<PathBuf>,
+    level: Option<i32>,
+}
+
+const USAGE: &str = "Usage: Crypt [-e|-E|-d|-D] <path>[,<path>...] [--workers <N>] [--level <n>] [--output <dir>]\n       Run with no arguments for interactive mode.";
+
+fn parse_cli_args() -> CliArgs {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut workers: Option<usize> = None;
+    let mut operation: Option<char> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut level: Option<i32> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+
+        if arg == "-e" || arg == "-E" {
+            set_operation(&mut operation, 'e');
+        } else if arg == "-d" || arg == "-D" {
+            set_operation(&mut operation, 'd');
+        } else if let Some(v) = arg.strip_prefix("--workers=") {
+            workers = Some(parse_worker_count(v));
+        } else if arg == "--workers" {
+            i += 1;
+            if i >= args.len() {
+                eprintln!("Error: --workers requires a value.\n{}", USAGE);
+                std::process::exit(2);
+            }
+            workers = Some(parse_worker_count(&args[i]));
+        } else if let Some(v) = arg.strip_prefix("--level=") {
+            level = Some(parse_compression_level(v));
+        } else if arg == "--level" {
+            i += 1;
+            if i >= args.len() {
+                eprintln!("Error: --level requires a value.\n{}", USAGE);
+                std::process::exit(2);
+            }
+            level = Some(parse_compression_level(&args[i]));
+        } else if let Some(v) = arg.strip_prefix("--output=") {
+            output = Some(PathBuf::from(v));
+        } else if arg == "--output" {
+            i += 1;
+            if i >= args.len() {
+                eprintln!("Error: --output requires a value.\n{}", USAGE);
+                std::process::exit(2);
+            }
+            output = Some(PathBuf::from(&args[i]));
+        } else if arg.starts_with('-') && arg != "-" {
+            eprintln!("Error: unknown flag '{}'.\n{}", arg, USAGE);
+            std::process::exit(2);
+        } else {
+            // Positional path(s); commas split multiple paths: `"a,b"`, `a b` and `"a", "b"`.
+            for part in arg.split(',') {
+                let trimmed = part.trim();
+                if !trimmed.is_empty() {
+                    paths.push(PathBuf::from(trimmed));
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    CliArgs { paths, workers, operation, output, level }
+}
+
+fn set_operation(operation: &mut Option<char>, op: char) {
+    match operation {
+        Some(existing) if *existing != op => {
+            eprintln!("Error: conflicting operation flags.\n{}", USAGE);
+            std::process::exit(2);
+        }
+        _ => *operation = Some(op),
+    }
+}
+
+fn parse_worker_count(value: &str) -> usize {
+    match value.trim().parse::<usize>() {
+        Ok(n) if n >= 1 => n,
+        _ => {
+            eprintln!("Error: --workers expects a positive integer, got '{}'.\n{}", value, USAGE);
+            std::process::exit(2);
+        }
+    }
+}
+
+fn parse_compression_level(value: &str) -> i32 {
+    let level = match value.trim().parse::<i32>() {
+        Ok(n) => n,
+        Err(_) => {
+            eprintln!("Error: --level expects an integer, got '{}'.\n{}", value, USAGE);
+            std::process::exit(2);
+        }
+    };
+    if level > MAX_ZSTD_LEVEL {
+        eprintln!("[WARN] --level {} exceeds the maximum of {}; using {}.", level, MAX_ZSTD_LEVEL, MAX_ZSTD_LEVEL);
+        MAX_ZSTD_LEVEL
+    } else if level < MIN_ZSTD_LEVEL {
+        eprintln!("[WARN] --level {} is below the minimum of {}; using {}.", level, MIN_ZSTD_LEVEL, MIN_ZSTD_LEVEL);
+        MIN_ZSTD_LEVEL
+    } else {
+        level
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let config = load_config();
-    let num_workers = config.num_workers.max(1);
+    let cli = parse_cli_args();
+
+    let requested_workers = cli.workers.unwrap_or(config.num_workers);
+    let num_workers = requested_workers.max(1);
+    if num_workers != requested_workers {
+        eprintln!("[WARN] num_workers {} is invalid; using 1.", requested_workers);
+    }
+
+    // `--level` overrides the config; anything above 22 is capped at 22.
+    let zstd_level = match cli.level {
+        Some(level) => level, // already validated/clamped when parsing the flag
+        None => {
+            let configured = config.zstd_compression_level;
+            let clamped = configured.clamp(MIN_ZSTD_LEVEL, MAX_ZSTD_LEVEL);
+            if clamped != configured {
+                eprintln!("[WARN] zstd_compression_level {} is out of range ({}..={}); using {}.", configured, MIN_ZSTD_LEVEL, MAX_ZSTD_LEVEL, clamped);
+            }
+            clamped
+        }
+    };
 
     let num_cores = num_cpus::get();
-    println!("Detected {} CPU cores. Using {} worker(s) (config).", num_cores, num_workers);
+    let source = if cli.workers.is_some() { "--workers" } else { "config" };
+    println!("Detected {} CPU cores. Using {} worker(s) ({}).", num_cores, num_workers, source);
+
+    // Fully interactive only when invoked with no arguments at all.
+    let interactive = cli.operation.is_none() && cli.paths.is_empty();
+
+    // In CLI mode an operation flag and at least one path are required.
+    if !interactive {
+        if cli.operation.is_none() {
+            eprintln!("Error: specify -e/-E (encrypt) or -d/-D (decrypt).\n{}", USAGE);
+            std::process::exit(2);
+        }
+        if cli.paths.is_empty() {
+            eprintln!("Error: no paths provided.\n{}", USAGE);
+            std::process::exit(2);
+        }
+    }
 
     // Get the operation choice first so we know whether to prompt once or twice.
-    let choice = get_choice();
+    let choice = match cli.operation {
+        Some(op) => op,
+        None => get_choice(),
+    };
+
+    if choice == 'd' && cli.level.is_some() {
+        eprintln!("[WARN] --level has no effect when decrypting; ignoring it.");
+    }
 
     let mut password = match choice {
         'e' => get_password_with_confirm(),
@@ -549,23 +855,56 @@ fn main() -> std::io::Result<()> {
     };
     let handle_derive = thread::spawn(move || {
         let salt = make_salt();
-        let key = derive_key(&pw_for_thread, &salt, &config_for_thread);
-        let result: (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) = (salt, key);
+        let cfg = &config_for_thread;
+        // Header key always uses the built-in defaults; the data key uses the user's config.
+        let header_key = derive_key(&pw_for_thread, &salt, HEADER_ARGON2_MEM_COST, HEADER_ARGON2_TIME_COST, HEADER_ARGON2_PARALLELISM);
+        // If the config already equals the built-in params, reuse the header key (no second heavy KDF).
+        let same_as_header = cfg.argon2_mem_cost == HEADER_ARGON2_MEM_COST
+            && cfg.argon2_time_cost == HEADER_ARGON2_TIME_COST
+            && cfg.argon2_parallelism == HEADER_ARGON2_PARALLELISM;
+        let data_key = if same_as_header {
+            header_key.clone()
+        } else {
+            derive_key(&pw_for_thread, &salt, cfg.argon2_mem_cost, cfg.argon2_time_cost, cfg.argon2_parallelism)
+        };
+        let result: (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) = (salt, header_key, data_key);
         let _ = key_tx.send(result);
     });
 
-    let input_paths = get_input_paths();
+    let input_paths = if interactive {
+        get_input_paths()
+    } else {
+        let mut valid: Vec<PathBuf> = Vec::new();
+        for path in cli.paths {
+            if path.exists() {
+                println!("Added: {}", path.display());
+                valid.push(path);
+            } else {
+                eprintln!("[WARN] Path does not exist: {}. Skipping.", path.display());
+            }
+        }
+        valid
+    };
 
     if input_paths.is_empty() {
         handle_derive.join().unwrap();
+        if !interactive { println!("No valid paths entered."); }
         return Ok(());
     }
 
-    let output_dir = get_output_dir();
+    // `--output` wins; otherwise prompt (interactive) or use the source's directory.
+    let output_dir = if let Some(dir) = cli.output {
+        ensure_output_dir(&dir);
+        Some(dir)
+    } else if interactive {
+        get_output_dir()
+    } else {
+        None
+    };
 
     match choice {
         'e' => {
-            let (salt, key) = key_rx.recv().unwrap();
+            let (salt, header_key, key) = key_rx.recv().unwrap();
             handle_derive.join().unwrap();
 
             let (archive_name, is_directory) = if input_paths.len() == 1 {
@@ -659,7 +998,6 @@ fn main() -> std::io::Result<()> {
                 Ok(())
             });
 
-            let zstd_level = config.zstd_compression_level;
             let mut worker_handles = Vec::new();
             for _ in 0..num_workers {
                 let raw_rx = raw_rx.clone();
@@ -710,7 +1048,10 @@ fn main() -> std::io::Result<()> {
             // num_workers * 3 to prevent memory from piling up if chunks arrive
             // severely out of order.
             let mut output_file = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&coffin_path)?);
-            write_crypt_header(&mut output_file, key.as_ref(), salt.as_ref(), is_directory, &archive_name)?;
+            write_crypt_header(
+                &mut output_file, header_key.as_ref(), salt.as_ref(), is_directory, &archive_name,
+                config.argon2_mem_cost, config.argon2_time_cost, config.argon2_parallelism,
+            )?;
 
             let mut next_index: u64 = 0;
             let mut pending: HashMap<u64, CompressedChunk> = HashMap::new();
@@ -781,6 +1122,7 @@ fn main() -> std::io::Result<()> {
             fs::rename(&coffin_path, &crypt_path)?;
 
             drop(key);
+            drop(header_key);
             drop(salt);
 
             let final_size = fs::metadata(&crypt_path).map(|m| m.len()).unwrap_or(0);
@@ -812,6 +1154,17 @@ fn main() -> std::io::Result<()> {
                 let mut salt = [0u8; SALT_SIZE];
                 if preader.read_exact(&mut salt).is_err() { eprintln!("Error: '{}' is truncated (missing salt). Skipping.", input_path.display()); continue; }
 
+                // v2 stored the data KDF params in the clear; v1 falls back to the config. v3 hides them in the header.
+                let (kdf_mem, kdf_time, kdf_par) = if version == 2 {
+                    let mut p = [0u8; 12];
+                    if preader.read_exact(&mut p).is_err() { eprintln!("Error: '{}' is truncated (missing KDF parameters). Skipping.", input_path.display()); continue; }
+                    (u32::from_le_bytes([p[0], p[1], p[2], p[3]]),
+                     u32::from_le_bytes([p[4], p[5], p[6], p[7]]),
+                     u32::from_le_bytes([p[8], p[9], p[10], p[11]]))
+                } else {
+                    (config.argon2_mem_cost, config.argon2_time_cost, config.argon2_parallelism)
+                };
+
                 let mut header_len_bytes = [0u8; 2];
                 if preader.read_exact(&mut header_len_bytes).is_err() { eprintln!("Error: '{}' is truncated (missing header). Skipping.", input_path.display()); continue; }
                 let header_total_len = u16::from_le_bytes(header_len_bytes) as usize;
@@ -820,10 +1173,20 @@ fn main() -> std::io::Result<()> {
                 if preader.read_exact(&mut header_encrypted).is_err() { eprintln!("Error: '{}' is truncated (missing header data). Skipping.", input_path.display()); continue; }
 
                 let salt_zero = Zeroizing::new(salt);
-                let key = derive_key(&*decrypt_password, &salt_zero, &config);
+
+                // v3 headers are always protected with the built-in params; v1/v2 used the single data key.
+                let header_key = if version >= 3 {
+                    derive_key(&*decrypt_password, &salt_zero, HEADER_ARGON2_MEM_COST, HEADER_ARGON2_TIME_COST, HEADER_ARGON2_PARALLELISM)
+                } else {
+                    if let Err(msg) = validate_kdf_params(kdf_mem, kdf_time, kdf_par) {
+                        eprintln!("Error: '{}' has invalid KDF parameters ({}). Skipping.", input_path.display(), msg);
+                        continue;
+                    }
+                    derive_key(&*decrypt_password, &salt_zero, kdf_mem, kdf_time, kdf_par)
+                };
 
                 // Header decrypt uses empty AAD (no chunk-level binding needed for metadata).
-                let header_plaintext = match aes_decrypt(&header_encrypted, key.as_ref(), &[]) {
+                let header_plaintext = match aes_decrypt(&header_encrypted, header_key.as_ref(), &[]) {
                     Ok(pt) => pt,
                     Err(e) => { eprintln!("Error decrypting '{}' header: {}. Wrong password or corrupted file. Skipping.", input_path.display(), e); continue; }
                 };
@@ -832,14 +1195,41 @@ fn main() -> std::io::Result<()> {
 
                 let is_directory = header_plaintext[0] == b'D';
                 let name_len = u16::from_le_bytes([header_plaintext[1], header_plaintext[2]]) as usize;
+                if header_plaintext.len() < 3 + name_len { eprintln!("Error: '{}' header too short. Skipping.", input_path.display()); continue; }
                 let name_bytes = &header_plaintext[3..3 + name_len];
                 let original_name = String::from_utf8_lossy(name_bytes).to_string();
                 let safe_name = sanitize_filename(&original_name);
 
+                // v3 hides the data KDF params at the end of the header; derive the data key from them.
+                let key = if version >= 3 {
+                    let pstart = 3 + name_len;
+                    if header_plaintext.len() < pstart + 12 {
+                        eprintln!("Error: '{}' header is missing KDF parameters. Skipping.", input_path.display());
+                        continue;
+                    }
+                    let p = &header_plaintext[pstart..pstart + 12];
+                    let (data_mem, data_time, data_par) = (
+                        u32::from_le_bytes([p[0], p[1], p[2], p[3]]),
+                        u32::from_le_bytes([p[4], p[5], p[6], p[7]]),
+                        u32::from_le_bytes([p[8], p[9], p[10], p[11]]),
+                    );
+                    if let Err(msg) = validate_kdf_params(data_mem, data_time, data_par) {
+                        eprintln!("Error: '{}' has invalid KDF parameters ({}). Skipping.", input_path.display(), msg);
+                        continue;
+                    }
+                    // If the data used the built-in params, the header key is already it.
+                    if data_mem == HEADER_ARGON2_MEM_COST && data_time == HEADER_ARGON2_TIME_COST && data_par == HEADER_ARGON2_PARALLELISM {
+                        header_key
+                    } else {
+                        derive_key(&*decrypt_password, &salt_zero, data_mem, data_time, data_par)
+                    }
+                } else {
+                    header_key
+                };
+
                 let parent = output_dir.as_deref().unwrap_or(
                     input_path.parent().unwrap_or(Path::new("."))
                 );
-                let output_path_dir = parent.join(&safe_name);
 
                 // Pipeline: Chunk reader (I/O) -> crossbeam (CPU workers: decrypt + decompress) -> Pipe writer (I/O)
 
@@ -847,7 +1237,8 @@ fn main() -> std::io::Result<()> {
 
                 let crypt_path = input_path.to_owned();
                 let key_thread = Arc::new(Zeroizing::new(key.as_ref().to_vec()));
-                let header_skip = 4u64 + 2 + SALT_SIZE as u64 + 2 + header_total_len as u64;
+                let argon_params_len = if version == 2 { 12u64 } else { 0 };
+                let header_skip = 4u64 + 2 + SALT_SIZE as u64 + argon_params_len + 2 + header_total_len as u64;
 
                 let total_file_size = fs::metadata(&crypt_path)?.len();
                 let total_data_size = total_file_size.saturating_sub(header_skip);
@@ -1000,23 +1391,33 @@ fn main() -> std::io::Result<()> {
                     Ok(())
                 });
 
+                // Name collisions (e.g. two inputs that both contain "docs") get a
+                // `_1`, `_2`, … suffix, numbered in the order they are produced.
+                let decrypted_to: String;
                 if is_directory {
-                    fs::create_dir_all(&output_path_dir)?;
+                    // Entries (including directory entries) carry their own relative paths.
                     let mut archive = tar::Archive::new(BufReader::with_capacity(8 * 1024 * 1024, raw_pipe_reader));
-                    unpack_tar_sanitized(&mut archive, &output_path_dir)?;
+                    let tops = unpack_tar_sanitized(&mut archive, parent)?;
+                    decrypted_to = tops.iter()
+                        .map(|t| parent.join(t).display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
                 } else {
-                    if let Some(parent_dir) = output_path_dir.parent() {
-                        if !parent_dir.as_os_str().is_empty() { fs::create_dir_all(parent_dir)?; }
-                    }
+                    if !parent.as_os_str().is_empty() { fs::create_dir_all(parent)?; }
+                    let dest = parent.join(unique_component(parent, &safe_name));
                     let mut archive = tar::Archive::new(BufReader::with_capacity(8 * 1024 * 1024, raw_pipe_reader));
-                    let mut entries: Vec<_> = archive.entries()?.filter_map(|e| e.ok()).collect();
-                    if entries.is_empty() {
-                        eprintln!("[WARN] No entries found in decrypted tar for '{}'.", input_path.display());
-                    } else {
-                        let mut entry = entries.remove(0);
-                        let mut output_file = File::create(&output_path_dir)?;
-                        std::io::copy(&mut entry, &mut output_file)?;
+                    // Read the first entry directly. Collecting all entries first would
+                    // advance the reader past it, so the copy would read zero bytes.
+                    let mut entries = archive.entries()?;
+                    match entries.next() {
+                        Some(entry) => {
+                            let mut entry = entry?;
+                            let mut output_file = File::create(&dest)?;
+                            std::io::copy(&mut entry, &mut output_file)?;
+                        }
+                        None => eprintln!("[WARN] No entries found in decrypted tar for '{}'.", input_path.display()),
                     }
+                    decrypted_to = dest.display().to_string();
                 }
 
                 done.store(true, Ordering::SeqCst);
@@ -1037,7 +1438,7 @@ fn main() -> std::io::Result<()> {
 
                 progress_handle.join().unwrap();
 
-                println!("Decrypted into: {}", output_path_dir.display());
+                println!("Decrypted into: {}", decrypted_to);
             }
 
             decrypt_password.zeroize();
