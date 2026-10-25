@@ -1,19 +1,51 @@
 [package]
-name = "Crypt"
-version = "1.0.0"
+name = "crypt"
+version = "2.0.0"
 edition = "2021"
+rust-version = "1.75"
+description = "Store large amounts of data in one .crypt file."
+license = "GPL-3.0-only"
+repository = "https://github.com/SavageDuck26/crypt"
+readme = "README.md"
+
+[features]
+# Deliberately weak Argon2id parameters so the test suite finishes quickly.
+# A real round trip at the built-in settings costs seconds and hundreds of MB.
+# Files written with this feature cannot be read by a normal build.
+test-kdf = []
 
 [dependencies]
 argon2 = "0.5.3"
 aes-gcm = "0.10.3"
-rand_core = { version = "0.6", features = ["getrandom"] }
 walkdir = "2.5.0"
 tar = "0.4.46"
+filetime = "0.2"
 zeroize = "1"
-zstd = { version = "0.13", features = ["experimental", "zstdmt"] }
-num_cpus = "1"
+zstd = "0.13"
 os_pipe = "1.2"
 crossbeam-channel = "0.5"
 termios = "0.3.3"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "0.8"
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+codegen-units = 1
+strip = "symbols"
+# NOTE: panic = "abort" is deliberately not set. 
+# It would skip the terminal restore guard in the password prompt and the thread-error handling.
+
+[lints.rust]
+# There is no unsafe code in this crate, and the format, framing and path
+# handling are exactly where it would be least welcome.
+unsafe_code = "forbid"
+# Every public item carries a doc comment; the library is meant to be usable.
+missing_docs = "warn"
+
+[lints.clippy]
+# Nothing half-finished should be able to reach a release build.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+

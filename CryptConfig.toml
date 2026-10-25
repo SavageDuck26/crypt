@@ -1,36 +1,39 @@
 # IMPORTANT NOTES:
-# Crypt only takes ASCII passwords.
+# crypt only accepts printable ASCII passwords.
 # Use a password over at least 8 characters.
-# CryptConfig must be in the same directory as Crypt.
+# CryptConfig is looked up in $CRYPT_CONFIG, then
+# $XDG_CONFIG_HOME/crypt/CryptConfig.toml (usually ~/.config/crypt/), then next to
+# the binary. If none exists, this file is written to the first of those places.
 
 # Worker threads. Overridden by the --workers <n> CLI flag.
 # Going over CPU cores will slow down progress.
 num_workers = 4
 
 # Argon2id parameters (mem cost in KiB; 524288 = 512 MiB).
-# Already on strong settings, higher is better. No CLI flag.
+# Fixed by the file format: ignored for new archives, and only consulted when
+# reading v1 archives. No CLI flag.
 argon2_mem_cost = 524288
 argon2_time_cost = 12
 argon2_parallelism = 2
 
 # Zstd compression level (1-22), 19+ is recommended.
-# --level <n> CLI flag. n>22 = 22.
+# --level <n> CLI flag. Values outside 1-22 are clamped.
 zstd_compression_level = 22
 
 
 # Encrypt Example:
-# Crypt -e "/crazystuff", "/otherstuff/coolstuff" --output "/externaldrive" --workers 10 --level 20
+# crypt -e "/crazystuff", "/otherstuff/coolstuff" --output "/externaldrive" --workers 10 --level 20
 
-# Crypt -e -> invokes binary in encryption mode.
+# crypt -e -> invokes binary in encryption mode.
 # "/crazystuff", "/otherstuff/coolstuff" -> paths to encrypt, comma separated.
 # --output "/externaldrive" -> where to save the .crypt file.
 # --workers 10 -> how many threads to work with.
 # --level 20 -> Zstd level.
 
 # Decrypt Example:
-# Crypt -d "/externaldrive/crazystuff.crypt", "/externaldrive/coolstuff.crypt" --output "/restored" --workers 10
+# crypt -d "/externaldrive/crazystuff-1f3a9c2b.crypt", "/externaldrive/coolstuff-9c3d21ab.crypt" --output "/restored" --workers 10
 
-# Crypt -d -> invokes binary in decryption mode.
-# "/externaldrive/crazystuff.crypt", "/externaldrive/coolstuff.crypt" -> .crypt files to decrypt, comma separated.
+# crypt -d -> invokes binary in decryption mode.
+# "/externaldrive/crazystuff-1f3a9c2b.crypt", "/externaldrive/coolstuff-9c3d21ab.crypt" -> .crypt files to decrypt, comma separated.
 # --output "/restored" -> where to save the decrypted files.
 # --workers 10 -> how many threads to work with.
