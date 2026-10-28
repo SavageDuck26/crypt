@@ -42,7 +42,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Cursor, IsTerminal, Read, Seek, Write};
+use std::io::{self, BufReader, BufWriter, IsTerminal, Read, Seek, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -58,7 +58,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use serde::Deserialize;
 use termios::{Termios, ECHO, ICANON, ISIG, TCSANOW};
 use zeroize::{Zeroize, Zeroizing};
-use zstd::stream::read::Decoder as ZstdDecoder;
+use zstd::bulk::Decompressor;
 
 // ---------------------------------------------------------------------------
 // Format constants
@@ -164,6 +164,21 @@ const MAX_ARGON2_PARALLELISM: u32 = 256;
 // ---------------------------------------------------------------------------
 
 const DEFAULT_NUM_WORKERS: usize = 4;
+
+/// Most workers crypt will start, from any of the ways the count can arrive
+/// (`--workers`, `num_workers` in the config, or `EncryptOptions::workers` and
+/// `DecryptOptions::workers` for a library caller). Each worker holds a 16 MiB
+/// chunk and its own Zstd context, and a chunk is memory rather than CPU bound
+/// once the level is high, so a larger number buys nothing but a bigger footprint
+/// and a thread that cannot be started.
+const MAX_WORKERS: usize = 128;
+
+/// Longest password accepted from a pipe, in bytes.
+///
+/// The prompt cannot exceed this because a person is typing, but a pipe can send
+/// anything at all, and `read_line` would happily allocate it. A password that
+/// does not fit here is not a password crypt encrypted anything with.
+const MAX_PIPED_PASSWORD_BYTES: usize = 4096;
 const DEFAULT_ZSTD_COMPRESSION_LEVEL: i32 = 22;
 const MIN_ZSTD_LEVEL: i32 = 1;
 const MAX_ZSTD_LEVEL: i32 = 22;
@@ -979,24 +994,32 @@ fn unique_component(base: &Path, name: &OsStr) -> OsString {
 /// Decompress one chunk, refusing to expand past `max_len`.
 ///
 /// A zstd frame may declare any content size, so the on-disk length cap alone is
-/// not enough: this is what stops a decompression bomb.
-fn decompress_chunk(data: &[u8], max_len: usize) -> Result<Vec<u8>> {
-    let decoder =
-        ZstdDecoder::new(Cursor::new(data)).map_err(|e| Error::other(format!("zstd: {e}")))?;
-    let mut out = Vec::new();
-    // Read one byte past the limit so exceeding it is distinguishable from
-    // hitting it exactly.
-    decoder
-        .take(max_len as u64 + 1)
-        .read_to_end(&mut out)
-        .map_err(|e| Error::other(format!("zstd decompression failed: {e}")))?;
-    if out.len() > max_len {
-        return Err(Error::malformed(format!(
-            "chunk decompressed past the maximum chunk size ({max_len} bytes); refusing what \
-             looks like a decompression bomb"
-        )));
+/// not enough: the declared size is checked first, and the destination buffer is
+/// capped at `max_len` as well, which catches a frame that declares nothing.
+/// Between them that is what stops a decompression bomb.
+///
+/// `decompressor` is one per worker, reused for every chunk. A fresh zstd
+/// context per chunk re-allocates its whole workspace (megabytes at the levels
+/// crypt recommends) for every 16 MiB chunk, which is the same reason the
+/// compressor on the encrypt side is reused.
+fn decompress_chunk(
+    decompressor: &mut Decompressor,
+    data: &[u8],
+    max_len: usize,
+) -> Result<Vec<u8>> {
+    if let Ok(Some(declared)) = zstd::zstd_safe::get_frame_content_size(data) {
+        if declared > max_len as u64 {
+            return Err(Error::malformed(format!(
+                "chunk declares {declared} bytes of content, past the maximum chunk size \
+                 ({max_len} bytes); refusing what looks like a decompression bomb"
+            )));
+        }
     }
-    Ok(out)
+    decompressor.decompress(data, max_len).map_err(|e| {
+        Error::malformed(format!(
+            "chunk decompressed past the maximum chunk size ({max_len} bytes) or is corrupt: {e}"
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1666,6 +1689,46 @@ impl Drop for TermiosGuard {
     }
 }
 
+/// Read one line from a pipe, with the newline dropped.
+///
+/// A byte at a time rather than `read_line`, so the line can be capped: a pipe
+/// can send as much as it likes and `read_line` would allocate all of it before
+/// anything could look at it. 4 KiB is far more than a password anyone types.
+fn read_piped_password() -> Result<Zeroizing<String>> {
+    let mut stdin = io::stdin().lock();
+    // Zeroizing: a line that is refused for being too long, or for not being
+    // valid UTF-8, still leaves nothing behind in freed memory.
+    let mut line: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(64));
+    let mut byte = [0u8; 1];
+
+    loop {
+        let read = stdin
+            .read(&mut byte)
+            .map_err(|e| Error::other(format!("cannot read the password from stdin: {e}")))?;
+        // End of input, or the end of the line. Either way the password is what
+        // came before, not an error: an empty line is a legitimate (if unwise)
+        // legacy password, and the caller decides whether to refuse it.
+        if read == 0 || byte[0] == b'\n' {
+            break;
+        }
+        if line.len() >= MAX_PIPED_PASSWORD_BYTES {
+            return Err(Error::invalid_input(format!(
+                "the password on stdin is longer than {MAX_PIPED_PASSWORD_BYTES} bytes"
+            )));
+        }
+        line.push(byte[0]);
+    }
+
+    // A CRLF line ending leaves the `\r` behind.
+    while line.last() == Some(&b'\r') {
+        line.pop();
+    }
+
+    let text = std::str::from_utf8(&line)
+        .map_err(|_| Error::invalid_input("the password on stdin is not valid UTF-8"))?;
+    Ok(Zeroizing::new(text.to_owned()))
+}
+
 /// Read a password from the terminal with masked echo.
 ///
 /// Keeps asking until the entry is printable ASCII: a non-ASCII character is
@@ -1772,14 +1835,7 @@ enum PasswordSource {
 
 fn read_password(confirm: bool, source: PasswordSource) -> Result<Zeroizing<String>> {
     if source == PasswordSource::Stdin {
-        let mut line = String::new();
-        io::stdin()
-            .read_line(&mut line)
-            .map_err(|e| Error::other(format!("cannot read the password from stdin: {e}")))?;
-        while line.ends_with('\n') || line.ends_with('\r') {
-            line.pop();
-        }
-        return Ok(Zeroizing::new(line));
+        return read_piped_password();
     }
 
     if !io::stdin().is_terminal() {
@@ -1876,7 +1932,9 @@ struct CompressedChunk {
 /// Knobs for [`encrypt_file`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncryptOptions {
-    /// Worker threads used to compress chunks. Zero is treated as one.
+    /// Worker threads used to compress chunks. Zero is treated as one, and
+    /// anything over 128 is capped at 128, so a caller cannot ask for a thread
+    /// count the machine cannot honour.
     ///
     /// Oversubscribing the machine costs memory rather than saving time: each
     /// worker holds a 16 MiB chunk plus a zstd context at the chosen level. Two
@@ -2088,7 +2146,7 @@ pub fn encrypt_file(
     fs::create_dir_all(&base_dir)
         .map_err(|e| Error::other(format!("cannot create '{}': {e}", base_dir.display())))?;
 
-    let workers = opts.workers.max(1);
+    let workers = opts.workers.clamp(1, MAX_WORKERS);
     let salt = random_salt();
     let keys = derive_keys(password, &salt)?;
 
@@ -2179,12 +2237,16 @@ pub fn encrypt_file(
     // `zstd::bulk::Compressor::new` would otherwise fail late and vaguely.
     let level = opts.level.clamp(MIN_ZSTD_LEVEL, MAX_ZSTD_LEVEL);
     let mut worker_handles = Vec::with_capacity(workers);
+    // Declared before the workers so a thread that cannot be started is reported
+    // like any other failure instead of panicking: `thread::spawn` panics, and a
+    // machine that has run out of threads is an error, not a bug in the caller.
+    let mut first_error: Option<Error> = None;
     for _ in 0..workers {
         let raw_rx = raw_rx.clone();
         let compressed_tx = compressed_tx.clone();
         let progress_worker = Arc::clone(&progress);
 
-        worker_handles.push(thread::spawn(move || -> Result<()> {
+        let spawned = thread::Builder::new().spawn(move || -> Result<()> {
             // One reusable compression context per worker: a fresh context per
             // chunk peaked at several GB per worker at level 22.
             let mut compressor = zstd::bulk::Compressor::new(level)
@@ -2212,11 +2274,23 @@ pub fn encrypt_file(
                 }
             }
             Ok(())
-        }));
+        });
+        match spawned {
+            Ok(handle) => worker_handles.push(handle),
+            Err(e) => {
+                first_error.get_or_insert_with(|| {
+                    Error::other(format!("cannot start a worker thread: {e}"))
+                });
+                break;
+            }
+        }
     }
     drop(compressed_tx);
+    // Dropping the last receiver of `raw_rx` here (the workers hold clones) means
+    // that if no worker could be started at all, the reader thread unblocks
+    // instead of waiting on a channel nobody is reading.
+    drop(raw_rx);
 
-    let mut first_error: Option<Error> = None;
     let written = match write_all_chunks(
         &mut output_file,
         &keys.data[..],
@@ -2344,7 +2418,8 @@ struct DecryptedChunk {
 /// Knobs for [`decrypt_file`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecryptOptions {
-    /// Worker threads used to decompress chunks. Zero is treated as one.
+    /// Worker threads used to decompress chunks. Zero is treated as one, and
+    /// anything over 128 is capped at 128.
     pub workers: usize,
     /// Recover whatever a partial (`.coffin`) archive contains instead of
     /// demanding that it be complete. Wrong-password and per-chunk
@@ -2386,7 +2461,7 @@ pub fn decrypt_file(
     output_dir: Option<&Path>,
     opts: &DecryptOptions,
 ) -> Result<Vec<PathBuf>> {
-    let workers = opts.workers.max(1);
+    let workers = opts.workers.clamp(1, MAX_WORKERS);
     let partial = opts.partial;
 
     let mut file = File::open(crypt_path)
@@ -2522,19 +2597,23 @@ pub fn decrypt_file(
     });
 
     let mut worker_handles = Vec::with_capacity(workers);
+    let mut worker_error: Option<Error> = None;
     for _ in 0..workers {
         let compressed_rx = compressed_rx.clone();
         let decrypted_tx = decrypted_tx.clone();
         let progress_worker = Arc::clone(&progress);
 
-        worker_handles.push(thread::spawn(move || -> Result<()> {
+        let spawned = thread::Builder::new().spawn(move || -> Result<()> {
+            // One decompression context per worker, reused for every chunk.
+            let mut decompressor = Decompressor::new()
+                .map_err(|e| Error::other(format!("cannot create a zstd decompressor: {e}")))?;
             loop {
                 let chunk = match compressed_rx.recv() {
                     Ok(chunk) => chunk,
                     Err(_) => break,
                 };
                 let index = chunk.index;
-                let raw = decompress_chunk(&chunk.compressed, CHUNK_SIZE)?;
+                let raw = decompress_chunk(&mut decompressor, &chunk.compressed, CHUNK_SIZE)?;
                 drop(chunk);
                 let raw_len = raw.len() as u64;
                 progress_worker.fetch_add(raw_len, Ordering::Relaxed);
@@ -2548,9 +2627,21 @@ pub fn decrypt_file(
                 }
             }
             Ok(())
-        }));
+        });
+        match spawned {
+            Ok(handle) => worker_handles.push(handle),
+            Err(e) => {
+                worker_error.get_or_insert_with(|| {
+                    Error::other(format!("cannot start a worker thread: {e}"))
+                });
+                break;
+            }
+        }
     }
     drop(decrypted_tx);
+    // As on the encrypt side: if no worker could be started, this unblocks the
+    // chunk reader instead of leaving it waiting on a channel with no readers.
+    drop(compressed_rx);
 
     // Pipe writer reorders chunks by index and streams them to the tar reader.
     let pipe_writer_handle = thread::spawn(move || -> Result<()> {
@@ -2622,7 +2713,6 @@ pub fn decrypt_file(
     let reader_result = chunk_reader_handle
         .join()
         .unwrap_or_else(|_| Err(Error::other("the chunk reader thread panicked")));
-    let mut worker_error = None;
     for handle in worker_handles {
         if let Ok(Err(e)) = handle.join() {
             worker_error.get_or_insert(e);
@@ -2693,7 +2783,7 @@ const USAGE: &str = "Usage: crypt [-e|-E|-d|-D] <path>[,<path>...] [--workers <N
 [--output <dir>] [--password-stdin]
        Run with no arguments for interactive mode.";
 
-const HELP: &str = "crypt — store large amounts of data privately. (not audited; see README.md)
+const HELP: &str = "crypt — store large amounts of data privately.
 
 USAGE:
     crypt -e <path>[,<path>...] [--output <dir>] [--workers <N>] [--level <n>]
@@ -2705,12 +2795,14 @@ OPTIONS:
     -d, -D                  Decrypt. Prompts for the password once.
     --output <dir>          Where the result goes; created if missing.
                             Defaults to the source's directory.
-    --workers <N>           Worker threads. Defaults to num_workers from the config.
+    --workers <N>           Worker threads (1-128; anything higher is clamped).
+                            Defaults to num_workers from the config.
     --level <n>             Zstd level (1-22); values outside the range are clamped.
                             Ignored when decrypting.
     --password-stdin        Read the password from stdin instead of the terminal.
-                            Arguments are never used for passwords: they are
-                            world-readable in the process list.
+                            At most 4096 bytes, and at most one line. Arguments
+                            are never used for passwords: they are world-readable
+                            in the process list.
     --                      Treat every later argument as a path.
     -h, --help              Show this help.
     -v, -V, --version       Show the version.
@@ -2723,17 +2815,17 @@ PATHS:
 
 INTERACTIVE MODE:
     `crypt` with no arguments at all asks for the operation, the paths, the
-    output directory and the password. It is one mode or the other: a stray flag
-    with no paths is a usage error rather than a prompt, and the password always
-    comes from the terminal there, so it cannot be scripted. Use the flags above
-    with --password-stdin to drive crypt from a script.
+    output directory and the password, which always comes from the terminal, so
+    it cannot be scripted. A flag with no operation and no paths is a usage
+    error rather than a prompt; use the flags above with --password-stdin to
+    drive crypt from a script.
 
 SKIPS:
     Only regular files and directories are archived. Symlinks, special files and
-    the archive crypt is writing are skipped and reported. So is a file it cannot
-    read, and so is a directory that is a mount point onto another filesystem:
-    those two append a warning to stderr saying the archive is valid but is not a
-    full copy, because finishing is not the same as being complete.
+    the archive crypt is writing are skipped and reported. So is a file that
+    cannot be read, and a directory that is a mount point onto another
+    filesystem: those two add a warning to stderr saying the archive is valid but
+    is not a full copy.
 
 EXIT STATUS:
     0  success
@@ -2771,7 +2863,16 @@ fn flag_value_str(flag: &str, value: &OsStr) -> Result<String> {
 fn parse_worker_count(value: &OsStr) -> Result<usize> {
     let text = flag_value_str("--workers", value)?;
     match text.trim().parse::<usize>() {
-        Ok(n) if n >= 1 => Ok(n),
+        Ok(n) if n >= 1 => {
+            if n > MAX_WORKERS {
+                eprintln!(
+                    "[WARN] --workers {n} exceeds the maximum of {MAX_WORKERS}; using {MAX_WORKERS}."
+                );
+                Ok(MAX_WORKERS)
+            } else {
+                Ok(n)
+            }
+        }
         _ => Err(Error::invalid_input(format!(
             "--workers expects a positive integer, got '{}'",
             text.trim()
@@ -3135,9 +3236,12 @@ pub fn run_os(args: &[OsString]) -> i32 {
     }
 
     let requested_workers = cli.workers.unwrap_or(config.num_workers);
-    let workers = requested_workers.max(1);
+    let workers = requested_workers.clamp(1, MAX_WORKERS);
     if workers != requested_workers {
-        eprintln!("[WARN] num_workers {requested_workers} is invalid; using 1.");
+        eprintln!(
+            "[WARN] {requested_workers} worker(s) requested; using {workers} (the valid range is \
+             1..={MAX_WORKERS})."
+        );
     }
 
     let level = match cli.level {
@@ -3302,6 +3406,7 @@ pub fn run_os(args: &[OsString]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     const HK: [u8; 32] = [0x11; 32];
     const DK: [u8; 32] = [0x22; 32];
@@ -3582,8 +3687,32 @@ mod tests {
             "the bomb should be small on disk"
         );
 
-        let err = decompress_chunk(&compressed, CHUNK_SIZE).unwrap_err();
+        let mut decompressor = Decompressor::new().unwrap();
+        let err = decompress_chunk(&mut decompressor, &compressed, CHUNK_SIZE).unwrap_err();
         assert!(err.to_string().contains("decompression bomb"), "{err}");
+    }
+
+    /// The declared size is the cheap check. A frame that declares nothing — a
+    /// streaming encoder does not know its input size, so it cannot write one —
+    /// has to be caught by the destination cap instead.
+    #[test]
+    fn a_bomb_that_declares_no_size_is_capped_too() {
+        let bomb = vec![0u8; CHUNK_SIZE + 1];
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.write_all(&bomb).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&compressed).unwrap(),
+            None,
+            "this frame is meant to declare no content size"
+        );
+
+        let mut decompressor = Decompressor::new().unwrap();
+        let err = decompress_chunk(&mut decompressor, &compressed, CHUNK_SIZE).unwrap_err();
+        assert!(
+            err.to_string().contains("maximum chunk size"),
+            "the cap has to reject it: {err}"
+        );
     }
 
     #[test]
@@ -3593,7 +3722,8 @@ mod tests {
         let compressed = compressor.compress(&data).unwrap();
         assert!(compressed.len() <= max_chunk_pt_len());
 
-        let restored = decompress_chunk(&compressed, CHUNK_SIZE).unwrap();
+        let mut decompressor = Decompressor::new().unwrap();
+        let restored = decompress_chunk(&mut decompressor, &compressed, CHUNK_SIZE).unwrap();
         assert_eq!(restored.len(), CHUNK_SIZE);
     }
 
@@ -3789,6 +3919,12 @@ mod tests {
         assert!(cli(&["-e", "a", "-d"]).is_err(), "conflicting operations");
         assert!(cli(&["--workers", "0", "-e", "a"]).is_err(), "zero workers");
         assert!(cli(&["--workers=abc"]).is_err(), "non-numeric workers");
+        // An absurd worker count is clamped, not rejected: it is the same class
+        // of request as an out-of-range level.
+        assert_eq!(
+            cli(&["--workers", "5000", "-e", "a"]).unwrap().workers,
+            Some(MAX_WORKERS)
+        );
         assert!(cli(&["--output"]).is_err(), "missing value");
         // Out-of-range levels are clamped, not rejected.
         assert_eq!(cli(&["--level", "99"]).unwrap().level, Some(MAX_ZSTD_LEVEL));

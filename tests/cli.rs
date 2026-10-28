@@ -805,6 +805,105 @@ fn unreadable_input_files_are_reported_as_missing_data() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// A worker count over the cap is clamped rather than obeyed, and a library
+/// caller asking for a million workers gets the same clamp instead of a panic.
+#[test]
+fn an_absurd_worker_count_is_clamped_to_the_cap() {
+    let dir = scratch("workercap");
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"hello").unwrap();
+
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    // `--level 1` on purpose: 128 workers at level 22 would want gigabytes of
+    // Zstd contexts just to prove a clamp.
+    let (code, stdout, stderr) = run_in(
+        &dir,
+        &[
+            "-e",
+            src.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--workers",
+            "5000",
+            "--level",
+            "1",
+            "--password-stdin",
+        ],
+        Some("correcthorse"),
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("exceeds the maximum of 128"),
+        "the clamp should be reported: {stderr}"
+    );
+    assert!(
+        stdout.contains("Using 128 worker(s)"),
+        "and 128 workers should have been used: {stdout}"
+    );
+
+    // The library clamps too, and it never panics on a thread count it cannot
+    // start.
+    let opts = crypt::EncryptOptions {
+        workers: usize::MAX,
+        level: 1,
+    };
+    let archive = crypt::encrypt_file(
+        std::slice::from_ref(&src),
+        "correcthorse",
+        Some(&out),
+        &opts,
+    )
+    .expect("a huge worker count must be clamped, not fatal");
+    assert!(archive.exists());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// The piped password is capped. A password that does not fit is refused rather
+/// than allocated, and one that fits still round trips.
+#[test]
+fn a_piped_password_is_capped_at_4096_bytes() {
+    let dir = scratch("pwcap");
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"hello").unwrap();
+
+    let long = "a".repeat(4096);
+    let out = dir.join("out");
+    let archive = encrypt(&dir, &src, &out, &long);
+
+    let dest = dir.join("dest");
+    let (code, _, stderr) = decrypt(&dir, &archive, &dest, &long);
+    assert_eq!(code, 0, "4096 bytes has to be accepted: {stderr}");
+    assert_eq!(fs::read(dest.join("src/a.txt")).unwrap(), b"hello");
+
+    // One byte over the cap is refused, and nothing is written.
+    let too_long = "a".repeat(4097);
+    let over = dir.join("over");
+    fs::create_dir_all(&over).unwrap();
+    let (code, _, stderr) = run_in(
+        &dir,
+        &[
+            "-e",
+            src.to_str().unwrap(),
+            "--output",
+            over.to_str().unwrap(),
+            "--password-stdin",
+        ],
+        Some(&too_long),
+    );
+    assert_ne!(code, 0, "4097 bytes has to be refused");
+    assert!(
+        stderr.contains("longer than 4096 bytes"),
+        "the cap should be named: {stderr}"
+    );
+    assert!(entries(&over).is_empty(), "{:?}", entries(&over));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 /// Interactive mode is exactly "no arguments". A flag on its own is a usage
 /// error, so the caller gets told instead of watching a prompt consume the pipe
 /// it meant as input.
