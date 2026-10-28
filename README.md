@@ -2,7 +2,7 @@
 
 Crypt is made for storing large amounts of data privately.
 
-Files and folders you give it get packed into a tar, compressed with Zstd, and then encrypted with AES-GCM. Keys are derived with Argon2id on heavy settings (512 MiB, 12 passes), which makes each guess expensive, but a bad idea in general.
+Files and folders you give it get packed into a tar, compressed with Zstd, and then encrypted with AES-GCM. Keys are derived with Argon2id on heavy settings (512 MiB, 12 passes).
 
 ## Usage
 
