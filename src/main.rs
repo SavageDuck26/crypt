@@ -4,8 +4,11 @@
 //! terminal or a process boundary.
 
 use std::env;
+use std::ffi::OsString;
 
 fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
-    std::process::exit(crypt::run(&args));
+    // `args_os`, not `args`: a path with bytes that are not valid UTF-8 is still
+    // a usable path, and `env::args` panics on the first such byte instead.
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
+    std::process::exit(crypt::run_os(&args));
 }

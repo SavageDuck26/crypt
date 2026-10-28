@@ -14,13 +14,14 @@ crypt -d "/externaldrive/crazystuff-1f3a9c2b.crypt" --output "/restored" --worke
 ```
 
 - `-e` / `-E` encrypt, `-d` / `-D` decrypt.
-- Paths are positional and comma separated when there's more than one. An argument that names a file which exists is always taken literally, so a path containing a comma still works: `crypt -e "/mnt/My, Files"` is one path, not two.
+- Paths are positional and comma separated when there's more than one. An argument that names a file which exists is always taken literally, so a path containing a comma still works: `crypt -e "/mnt/My, Files"` is one path, not two. Paths are passed through as raw bytes, so a name that isn't valid UTF-8 works too.
 - `--output <dir>` where the result goes. It gets created if it isn't there already; leave it off and it goes next to the source.
 - `--workers <n>` how many threads to work with.
 - `--level <n>` the Zstd level, 19+ is recommended. Anything over 22 gets clamped to 22. It does nothing on decrypt.
 - `--password-stdin` reads the password from a pipe instead of prompting. See Passwords below.
 - `-h` / `--help` shows the usage, and `-v` / `--version` shows the version.
 - Exit status is 0 on success, 1 if any file failed, 2 for a usage error.
+- With no arguments at all, crypt is interactive and asks you for everything. That's a separate mode: it takes no flags, and a flag with no operation and no paths is a usage error rather than a prompt.
 - Encrypting `/crazystuff` writes `/externaldrive/crazystuff-1f3a9c2b.crypt`: the file is named after the first path you gave, plus a random 8-character suffix so repeated runs never collide.
 - `.` and `..` work as inputs even though they have no name of their own: the archive is named after the directory they resolve to.
 - If the output directory is inside what you are encrypting, the half-written `.coffin` is skipped rather than packed into itself.
@@ -78,5 +79,6 @@ Plain `cargo test` runs the unit tests. The end-to-end tests in `tests/` drive t
 ## Misc
 
 - Symlinks and other oddities are skipped. Only normal files and folders go in.
+- A run says what it left out. Symlinks, special files and the archive crypt is writing are reported as an informational line, since crypt never archives them anyway. A file it cannot read, and a directory that is a mount point onto another filesystem, get a `[WARN]` on stderr saying the archive is valid but is not a full copy: crypt stays on one filesystem per input, so an archive of `/home` with a separate volume mounted inside it does not quietly swallow that volume — or archive it under a name you didn't ask for.
 - If two things decrypted share a name, the second gets a '_1', then '_2', etc.
 - The header is always locked with the built-in Argon2id settings, and every stream ends with an authenticated footer, so a file that's been cut short is caught instead of quietly half-decrypting.

@@ -8,6 +8,7 @@
 
 #![cfg(feature = "test-kdf")]
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -35,7 +36,14 @@ fn scratch(tag: &str) -> PathBuf {
 
 /// Run the binary against a private config path, with an optional password on
 /// stdin. Returns (exit code, stdout, stderr).
-fn run_in(dir: &Path, args: &[&str], password: Option<&str>) -> (i32, String, String) {
+///
+/// Generic over the argument type: a test about a path that is not valid UTF-8
+/// has to hand the argument in as an `OsString`, exactly as a shell would.
+fn run_in<S: AsRef<OsStr>>(
+    dir: &Path,
+    args: &[S],
+    password: Option<&str>,
+) -> (i32, String, String) {
     // Beside the scratch directory, never inside it: crypt writes the config on
     // first run, and a file it creates inside a tree that is being archived would
     // end up in the archive.
@@ -45,7 +53,7 @@ fn run_in(dir: &Path, args: &[&str], password: Option<&str>) -> (i32, String, St
     ));
     let mut command = Command::new(bin());
     command
-        .args(args)
+        .args(args.iter().map(|arg| arg.as_ref()))
         // Relative arguments (`.`, for instance) must resolve inside the scratch
         // directory, not wherever the test harness happens to run.
         .current_dir(dir)
@@ -694,6 +702,125 @@ fn library_round_trip_through_the_public_api() {
         "expected a truncated error, got {err:?}"
     );
     assert!(entries(&partial_out).is_empty());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// A path whose bytes are not valid UTF-8 is a usable path, and must reach crypt
+/// as one. `env::args` would have panicked on it before the argument was ever
+/// looked at, which is why the binary reads `args_os`.
+#[test]
+fn a_path_with_invalid_utf8_can_be_encrypted_from_the_command_line() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = scratch("argv-nonutf8");
+    let odd = OsString::from_vec(b"bad\xffdir".to_vec());
+    let src = dir.join(&odd);
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"payload").unwrap();
+
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let (code, _, stderr) = run_in(
+        &dir,
+        &[
+            OsString::from("-e"),
+            src.clone().into_os_string(),
+            OsString::from("--output"),
+            out.clone().into_os_string(),
+            OsString::from("--password-stdin"),
+        ],
+        Some("correcthorse"),
+    );
+    assert_eq!(code, 0, "a non-UTF-8 path must be usable: {stderr}");
+
+    // The archive is named after its input, so its name is not UTF-8 either.
+    let archive = only_crypt_file(&out);
+
+    let dest = dir.join("dest");
+    let (code, _, stderr) = run_in(
+        &dir,
+        &[
+            OsString::from("-d"),
+            archive.clone().into_os_string(),
+            OsString::from("--output"),
+            dest.clone().into_os_string(),
+            OsString::from("--password-stdin"),
+        ],
+        Some("correcthorse"),
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(fs::read(dest.join(&odd).join("a.txt")).unwrap(), b"payload");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// A file crypt cannot read is data the archive does not have. The run still
+/// succeeds — one locked file in a big tree should not fail a backup — but it has
+/// to say so, because "finished" used to read as "complete".
+#[test]
+fn unreadable_input_files_are_reported_as_missing_data() {
+    let dir = scratch("unreadable");
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("fine.txt"), b"fine").unwrap();
+    let locked = src.join("locked.txt");
+    fs::write(&locked, b"secret").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    // As root, 0o000 does not actually stop a read, and the test could not show
+    // anything. Skip instead of asserting on what this machine cannot produce.
+    if fs::read(&locked).is_ok() {
+        fs::remove_dir_all(&dir).ok();
+        return;
+    }
+
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let (code, _, stderr) = run_in(
+        &dir,
+        &[
+            "-e",
+            src.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+            "--password-stdin",
+        ],
+        Some("correcthorse"),
+    );
+    assert_eq!(code, 0, "the readable part is still archived: {stderr}");
+    assert!(stderr.contains("unreadable file"), "{stderr}");
+    assert!(
+        stderr.contains("NOT a full copy") && stderr.contains("1 unreadable entry"),
+        "the shortfall has to be stated plainly: {stderr}"
+    );
+
+    // The archive is real: it holds the file that could be read.
+    let dest = dir.join("dest");
+    let (code, _, stderr) = decrypt(&dir, &only_crypt_file(&out), &dest, "correcthorse");
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(entries(&dest.join("src")), vec!["fine.txt".to_string()]);
+
+    let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o600));
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Interactive mode is exactly "no arguments". A flag on its own is a usage
+/// error, so the caller gets told instead of watching a prompt consume the pipe
+/// it meant as input.
+#[test]
+fn a_lone_flag_is_a_usage_error_instead_of_an_interactive_prompt() {
+    let dir = scratch("loneflag");
+    let (code, stdout, stderr) = run_in(&dir, &["--password-stdin"], None);
+    assert_eq!(code, 2, "expected a usage error: {stdout}{stderr}");
+    assert!(
+        stderr.contains("specify -e/-E (encrypt) or -d/-D (decrypt)"),
+        "{stderr}"
+    );
+    assert!(
+        !stdout.contains("Enter 'e' to encrypt"),
+        "nothing may be prompted for: {stdout}"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }

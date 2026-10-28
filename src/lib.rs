@@ -31,8 +31,10 @@
 //!
 //! [`encrypt_file`] and [`decrypt_file`] are the library surface, their knobs
 //! live in [`EncryptOptions`] and [`DecryptOptions`], and failures come back as
-//! a typed [`Error`]. [`run`] is the CLI entry point; the config file is a CLI
-//! convenience that a library caller simply does not use.
+//! a typed [`Error`]. [`run_os`] is the CLI entry point — [`run`] is the same
+//! thing for callers that only have `String`s, and the binary uses the `OsString`
+//! one so a path that is not valid UTF-8 still arrives intact. The config file is
+//! a CLI convenience that a library caller simply does not use.
 
 use std::collections::HashMap;
 use std::env;
@@ -51,7 +53,7 @@ use std::thread;
 
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use serde::Deserialize;
 use termios::{Termios, ECHO, ICANON, ISIG, TCSANOW};
@@ -456,8 +458,22 @@ fn derive_keys(password: &str, salt: &[u8; SALT_SIZE]) -> Result<FileKeys> {
 // AEAD helpers
 // ---------------------------------------------------------------------------
 
+/// Build the AES-256-GCM cipher, refusing a key of the wrong size.
+///
+/// `Aes256Gcm::new` panics on a wrong length. Every caller here passes
+/// [`KEY_SIZE`] bytes, but reporting rather than aborting is what keeps the
+/// library's side of the bargain: bad input is an error, never a panic.
+fn cipher_for(key: &[u8]) -> Result<Aes256Gcm> {
+    Aes256Gcm::new_from_slice(key).map_err(|_| {
+        Error::other(format!(
+            "internal error: the AES-GCM key must be {KEY_SIZE} bytes, got {}",
+            key.len()
+        ))
+    })
+}
+
 fn aes_encrypt(data: &[u8], key: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let cipher = cipher_for(key)?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let ciphertext = cipher
         .encrypt(&nonce, Payload { msg: data, aad })
@@ -474,7 +490,7 @@ fn aes_decrypt(encrypted: &[u8], key: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec
     }
     let nonce = &encrypted[..NONCE_SIZE];
     let ciphertext = &encrypted[NONCE_SIZE..];
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let cipher = cipher_for(key)?;
     cipher
         .decrypt(
             Nonce::from_slice(nonce),
@@ -993,6 +1009,63 @@ struct TarStats {
     pub others_skipped: u64,
     /// Times the archive being written was found inside the tree being packed.
     pub staging_skipped: u64,
+    /// Entries that could not be opened or read while packing. Their data is
+    /// missing from the archive.
+    pub unreadable: u64,
+    /// Directories left alone because they are a mount point onto another
+    /// filesystem. Their data is missing from the archive too.
+    pub other_filesystem: u64,
+}
+
+impl TarStats {
+    /// True when the archive is missing data the caller asked for, as opposed to
+    /// merely omitting what crypt never archives in the first place (symlinks,
+    /// special files, its own staging file).
+    fn lost_data(&self) -> bool {
+        self.unreadable > 0 || self.other_filesystem > 0
+    }
+}
+
+/// Say what the archive does not contain.
+///
+/// Everything crypt never archives is reported on stdout as informational, the
+/// way it always has been. Data that was *meant* to be archived and could not be
+/// is a warning on stderr, and it names the categories, because "the run
+/// finished" must not read as "the backup is complete" when it is not.
+fn report_skips(stats: &TarStats) {
+    if stats.symlinks_skipped > 0 || stats.others_skipped > 0 || stats.staging_skipped > 0 {
+        println!(
+            "Skipped {} symlink(s), {} special file(s) and {} in-progress output file(s) while packing.",
+            stats.symlinks_skipped, stats.others_skipped, stats.staging_skipped
+        );
+    }
+    if !stats.lost_data() {
+        return;
+    }
+    let mut missing = Vec::new();
+    if stats.unreadable > 0 {
+        missing.push(format!(
+            "{} unreadable entr{}",
+            stats.unreadable,
+            if stats.unreadable == 1 { "y" } else { "ies" }
+        ));
+    }
+    if stats.other_filesystem > 0 {
+        missing.push(format!(
+            "{} director{} on another filesystem",
+            stats.other_filesystem,
+            if stats.other_filesystem == 1 {
+                "y (a mount point)"
+            } else {
+                "ies (mount points)"
+            }
+        ));
+    }
+    eprintln!(
+        "[WARN] The archive is valid but NOT a full copy: {}. See the warnings above, fix the \
+         inputs and run crypt again if you need everything.",
+        missing.join(" and ")
+    );
 }
 
 /// Copy real permission bits and mtime into a tar header, and zero the ownership
@@ -1007,10 +1080,12 @@ fn apply_metadata(header: &mut tar::Header, meta: &fs::Metadata) {
     header.set_gid(0);
 }
 
+/// Add one regular file, counting it as missing data if it cannot be opened.
 fn add_file_to_tar<W: Write>(
     builder: &mut tar::Builder<W>,
     archive_path: &Path,
     source: &Path,
+    stats: &mut TarStats,
 ) -> Result<()> {
     let file = match File::open(source) {
         Ok(f) => f,
@@ -1019,6 +1094,7 @@ fn add_file_to_tar<W: Write>(
                 "[WARN] Skipping unreadable file '{}': {e}",
                 source.display()
             );
+            stats.unreadable += 1;
             return Ok(());
         }
     };
@@ -1047,6 +1123,12 @@ fn add_file_to_tar<W: Write>(
 ///
 /// Symlinks are skipped outright: following them would silently archive the
 /// contents of files outside the tree (a symlink to ~/.ssh/id_rsa, for example).
+///
+/// The walk stays on one filesystem per input, so a mount point inside the tree
+/// does not drag another disk (or a network mount, or a tmpfs) into the archive.
+/// `same_file_system` does that pruning without a word, so this walk drives a
+/// plain iterator and does the check itself — that is what lets the directory it
+/// leaves out be counted and reported rather than silently missing.
 fn add_tree_to_tar<W: Write>(
     builder: &mut tar::Builder<W>,
     archive_root: &Path,
@@ -1054,10 +1136,14 @@ fn add_tree_to_tar<W: Write>(
     staging: Option<&Path>,
     stats: &mut TarStats,
 ) -> Result<()> {
-    for walk_entry in walkdir::WalkDir::new(source_root)
+    let root_device = fs::symlink_metadata(source_root)
+        .map(|meta| meta.dev())
+        .ok();
+
+    let mut walker = walkdir::WalkDir::new(source_root)
         .follow_links(false)
-        .same_file_system(true)
-    {
+        .into_iter();
+    while let Some(walk_entry) = walker.next() {
         let walk_entry = match walk_entry {
             Ok(entry) => entry,
             Err(e) => {
@@ -1066,6 +1152,9 @@ fn add_tree_to_tar<W: Write>(
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
                 eprintln!("[WARN] Skipping '{}': {e}", path);
+                // A tree crypt cannot read is missing data, not an oddity it
+                // never archives in the first place.
+                stats.unreadable += 1;
                 continue;
             }
         };
@@ -1107,10 +1196,26 @@ fn add_tree_to_tar<W: Write>(
             Ok(meta) => meta,
             Err(e) => {
                 eprintln!("[WARN] Skipping '{}': {e}", walk_entry.path().display());
+                stats.unreadable += 1;
                 continue;
             }
         };
         let file_type = meta.file_type();
+
+        // A directory on a different device is a mount point. It is left out
+        // entirely (as `same_file_system` used to do silently) rather than
+        // archived as an empty directory, and the walk does not descend.
+        if file_type.is_dir() && root_device.is_some_and(|device| meta.dev() != device) {
+            eprintln!(
+                "[WARN] Skipping '{}': it is on another filesystem (a mount point), so crypt stays \
+                 under '{}'.",
+                walk_entry.path().display(),
+                source_root.display()
+            );
+            stats.other_filesystem += 1;
+            walker.skip_current_dir();
+            continue;
+        }
 
         if file_type.is_dir() {
             let mut header = tar::Header::new_gnu();
@@ -1126,8 +1231,15 @@ fn add_tree_to_tar<W: Write>(
                     ))
                 })?;
         } else if file_type.is_file() {
-            add_file_to_tar(builder, &archive_path, walk_entry.path())?;
+            add_file_to_tar(builder, &archive_path, walk_entry.path(), stats)?;
         } else if file_type.is_symlink() {
+            // The walk called this a regular file or a directory and the re-stat
+            // called it a symlink, so the path changed underneath us: report it
+            // rather than dropping the entry without a word.
+            eprintln!(
+                "[WARN] Skipping '{}': it turned into a symlink while the tree was being packed.",
+                walk_entry.path().display()
+            );
             stats.symlinks_skipped += 1;
         } else {
             eprintln!(
@@ -1214,7 +1326,7 @@ fn build_tar<W: Write>(paths: &[PathBuf], writer: W, staging: Option<&Path>) -> 
         if meta.is_dir() {
             add_tree_to_tar(&mut builder, &root, path, staging, &mut stats)?;
         } else if meta.is_file() {
-            add_file_to_tar(&mut builder, &root, path)?;
+            add_file_to_tar(&mut builder, &root, path, &mut stats)?;
         } else {
             return Err(Error::invalid_input(format!(
                 "'{}' is neither a regular file nor a directory",
@@ -1582,7 +1694,9 @@ fn prompt_masked(prompt: &str) -> Result<Zeroizing<String>> {
 
     let mut stdin = io::stdin();
     'attempt: loop {
-        let mut typed: Vec<u8> = Vec::new();
+        // Zeroizing: an attempt that is thrown away for being non-ASCII, or that
+        // never becomes a password, still leaves nothing in freed memory.
+        let mut typed: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
 
         loop {
             let mut byte = [0u8; 1];
@@ -1636,8 +1750,11 @@ fn prompt_masked(prompt: &str) -> Result<Zeroizing<String>> {
             continue 'attempt;
         }
 
-        return match String::from_utf8(typed) {
-            Ok(password) => Ok(Zeroizing::new(password)),
+        // Borrowed rather than consumed, so the bytes above are zeroized either
+        // way. The bytes accepted by the read loop are all ASCII, so this error
+        // is unreachable today; it stays as the belt to that pair of braces.
+        return match std::str::from_utf8(&typed) {
+            Ok(password) => Ok(Zeroizing::new(password.to_owned())),
             Err(_) => Err(Error::other("password entry contained invalid bytes")),
         };
     }
@@ -1786,8 +1903,9 @@ fn random_salt() -> Zeroizing<[u8; SALT_SIZE]> {
 }
 
 /// Total size of the regular files under `path`, using the same rules the
-/// archiver uses (symlinks and special files are skipped), so the progress bar
-/// denominator matches what is actually read.
+/// archiver uses (symlinks and special files are skipped, and so are
+/// directories on another filesystem), so the progress bar denominator matches
+/// what is actually read.
 fn tree_size(path: &Path) -> Result<u64> {
     let mut total = 0u64;
     for entry in walkdir::WalkDir::new(path)
@@ -2203,15 +2321,7 @@ pub fn encrypt_file(
     }
     guard.keep = true;
     sync_dir(&base_dir);
-    if tar_stats.symlinks_skipped > 0
-        || tar_stats.others_skipped > 0
-        || tar_stats.staging_skipped > 0
-    {
-        println!(
-            "Skipped {} symlink(s), {} special file(s) and {} in-progress output file(s) while packing.",
-            tar_stats.symlinks_skipped, tar_stats.others_skipped, tar_stats.staging_skipped
-        );
-    }
+    report_skips(&tar_stats);
 
     Ok(crypt_path)
 }
@@ -2588,7 +2698,7 @@ const HELP: &str = "crypt — store large amounts of data privately. (not audite
 USAGE:
     crypt -e <path>[,<path>...] [--output <dir>] [--workers <N>] [--level <n>]
     crypt -d <file.crypt>[,<file.crypt>...] [--output <dir>] [--workers <N>]
-    crypt                       (interactive)
+    crypt                       (interactive; takes no arguments)
 
 OPTIONS:
     -e, -E                  Encrypt. Prompts for the password twice.
@@ -2611,6 +2721,20 @@ PATHS:
     comma still works. `.` and `..` are accepted and the archive is named after
     the directory they resolve to.
 
+INTERACTIVE MODE:
+    `crypt` with no arguments at all asks for the operation, the paths, the
+    output directory and the password. It is one mode or the other: a stray flag
+    with no paths is a usage error rather than a prompt, and the password always
+    comes from the terminal there, so it cannot be scripted. Use the flags above
+    with --password-stdin to drive crypt from a script.
+
+SKIPS:
+    Only regular files and directories are archived. Symlinks, special files and
+    the archive crypt is writing are skipped and reported. So is a file it cannot
+    read, and so is a directory that is a mount point onto another filesystem:
+    those two append a warning to stderr saying the archive is valid but is not a
+    full copy, because finishing is not the same as being complete.
+
 EXIT STATUS:
     0  success
     1  one or more inputs failed (decrypt continues past a bad file)
@@ -2632,19 +2756,33 @@ struct CliArgs {
     pub version: bool,
 }
 
-fn parse_worker_count(value: &str) -> Result<usize> {
-    match value.trim().parse::<usize>() {
+/// A flag's value as text, for the flags whose value must be UTF-8 anyway
+/// (they are numbers). `--output` is the one that carries a path, so it goes
+/// through `OsStr` untouched instead.
+fn flag_value_str(flag: &str, value: &OsStr) -> Result<String> {
+    value.to_str().map(str::to_owned).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "{flag} expects UTF-8 text, got '{}'",
+            value.to_string_lossy()
+        ))
+    })
+}
+
+fn parse_worker_count(value: &OsStr) -> Result<usize> {
+    let text = flag_value_str("--workers", value)?;
+    match text.trim().parse::<usize>() {
         Ok(n) if n >= 1 => Ok(n),
         _ => Err(Error::invalid_input(format!(
             "--workers expects a positive integer, got '{}'",
-            value
+            text.trim()
         ))),
     }
 }
 
-fn parse_compression_level(value: &str) -> Result<i32> {
-    let level = value.trim().parse::<i32>().map_err(|_| {
-        Error::invalid_input(format!("--level expects an integer, got '{}'", value))
+fn parse_compression_level(value: &OsStr) -> Result<i32> {
+    let text = flag_value_str("--level", value)?;
+    let level = text.trim().parse::<i32>().map_err(|_| {
+        Error::invalid_input(format!("--level expects an integer, got '{}'", text.trim()))
     })?;
     if level > MAX_ZSTD_LEVEL {
         eprintln!(
@@ -2663,13 +2801,17 @@ fn parse_compression_level(value: &str) -> Result<i32> {
     }
 }
 
-fn parse_cli(args: &[String]) -> Result<CliArgs> {
+/// Parse the command line. Generic over the argument type so the CLI can hand in
+/// `OsString`s straight from `env::args_os` while tests (and [`run`]) can hand in
+/// `String`s.
+fn parse_cli<S: AsRef<OsStr>>(args: &[S]) -> Result<CliArgs> {
     let mut parsed = CliArgs::default();
     let mut only_paths = false;
     let mut i = 0;
 
     while i < args.len() {
-        let arg = &args[i];
+        let arg = args[i].as_ref();
+        let bytes = arg.as_bytes();
 
         if only_paths {
             push_paths(&mut parsed.paths, arg);
@@ -2677,44 +2819,50 @@ fn parse_cli(args: &[String]) -> Result<CliArgs> {
             continue;
         }
 
-        if arg == "--" {
+        if arg == OsStr::new("--") {
             only_paths = true;
-        } else if arg == "-h" || arg == "--help" {
+        } else if arg == OsStr::new("-h") || arg == OsStr::new("--help") {
             parsed.help = true;
-        } else if arg == "-v" || arg == "-V" || arg == "--version" {
+        } else if arg == OsStr::new("-v")
+            || arg == OsStr::new("-V")
+            || arg == OsStr::new("--version")
+        {
             parsed.version = true;
-        } else if arg == "--password-stdin" {
+        } else if arg == OsStr::new("--password-stdin") {
             parsed.password_stdin = true;
-        } else if arg == "-e" || arg == "-E" {
+        } else if arg == OsStr::new("-e") || arg == OsStr::new("-E") {
             set_operation(&mut parsed.operation, 'e')?;
-        } else if arg == "-d" || arg == "-D" {
+        } else if arg == OsStr::new("-d") || arg == OsStr::new("-D") {
             set_operation(&mut parsed.operation, 'd')?;
-        } else if let Some(value) = arg.strip_prefix("--workers=") {
-            parsed.workers = Some(parse_worker_count(value)?);
-        } else if arg == "--workers" {
+        } else if let Some(value) = bytes.strip_prefix(b"--workers=") {
+            parsed.workers = Some(parse_worker_count(OsStr::from_bytes(value))?);
+        } else if arg == OsStr::new("--workers") {
             i += 1;
             let value = args
                 .get(i)
                 .ok_or_else(|| Error::invalid_input("--workers requires a value"))?;
-            parsed.workers = Some(parse_worker_count(value)?);
-        } else if let Some(value) = arg.strip_prefix("--level=") {
-            parsed.level = Some(parse_compression_level(value)?);
-        } else if arg == "--level" {
+            parsed.workers = Some(parse_worker_count(value.as_ref())?);
+        } else if let Some(value) = bytes.strip_prefix(b"--level=") {
+            parsed.level = Some(parse_compression_level(OsStr::from_bytes(value))?);
+        } else if arg == OsStr::new("--level") {
             i += 1;
             let value = args
                 .get(i)
                 .ok_or_else(|| Error::invalid_input("--level requires a value"))?;
-            parsed.level = Some(parse_compression_level(value)?);
-        } else if let Some(value) = arg.strip_prefix("--output=") {
-            parsed.output = Some(PathBuf::from(value));
-        } else if arg == "--output" {
+            parsed.level = Some(parse_compression_level(value.as_ref())?);
+        } else if let Some(value) = bytes.strip_prefix(b"--output=") {
+            parsed.output = Some(PathBuf::from(OsString::from_vec(value.to_vec())));
+        } else if arg == OsStr::new("--output") {
             i += 1;
             let value = args
                 .get(i)
                 .ok_or_else(|| Error::invalid_input("--output requires a value"))?;
-            parsed.output = Some(PathBuf::from(value));
-        } else if arg.starts_with('-') && arg != "-" {
-            return Err(Error::invalid_input(format!("unknown flag '{}'", arg)));
+            parsed.output = Some(PathBuf::from(value.as_ref()));
+        } else if bytes.first() == Some(&b'-') && arg != OsStr::new("-") {
+            return Err(Error::invalid_input(format!(
+                "unknown flag '{}'",
+                arg.to_string_lossy()
+            )));
         } else {
             push_paths(&mut parsed.paths, arg);
         }
@@ -2732,21 +2880,38 @@ fn parse_cli(args: &[String]) -> Result<CliArgs> {
 /// called `/mnt/My, Files`) can still be named directly instead of being torn in
 /// two. Splitting wins over a literal name that does not exist, which keeps the
 /// documented comma-separated form working.
-fn push_paths(paths: &mut Vec<PathBuf>, arg: &str) {
-    let trimmed = arg.trim();
+///
+/// Works on bytes rather than `str`, so a path named with invalid UTF-8 is one
+/// path instead of an argument the parser refuses to look at.
+fn push_paths(paths: &mut Vec<PathBuf>, arg: &OsStr) {
+    let trimmed = trim_ascii(arg.as_bytes());
     if trimmed.is_empty() {
         return;
     }
-    if !trimmed.contains(',') || Path::new(trimmed).exists() {
-        paths.push(PathBuf::from(trimmed));
+    let path = Path::new(OsStr::from_bytes(trimmed));
+    if !trimmed.contains(&b',') || path.exists() {
+        paths.push(path.to_path_buf());
         return;
     }
-    for part in trimmed.split(',') {
-        let part = part.trim();
+    for part in trimmed.split(|byte| *byte == b',') {
+        let part = trim_ascii(part);
         if !part.is_empty() {
-            paths.push(PathBuf::from(part));
+            paths.push(PathBuf::from(OsString::from_vec(part.to_vec())));
         }
     }
+}
+
+/// `slice::trim_ascii` is newer than this crate's MSRV, so trim by hand.
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
 }
 
 fn set_operation(operation: &mut Option<char>, op: char) -> Result<()> {
@@ -2875,7 +3040,7 @@ fn get_input_paths() -> Vec<PathBuf> {
             }
             break;
         }
-        push_paths(&mut paths, trimmed);
+        push_paths(&mut paths, OsStr::new(trimmed));
     }
     paths
 }
@@ -2913,12 +3078,23 @@ fn get_output_dir() -> Option<PathBuf> {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Run the whole program and return the process exit code.
+/// Run the whole program with UTF-8 arguments and return the process exit code.
 ///
 /// Everything cheap happens first: arguments, paths and the output directory are
 /// all checked before the password prompt and the (deliberately expensive) key
 /// derivation, so a typo does not cost 512 MiB of Argon2id.
 pub fn run(args: &[String]) -> i32 {
+    let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    run_os(&args)
+}
+
+/// The same, taking arguments exactly as the operating system reported them.
+///
+/// This is what the binary calls. A path whose bytes are not valid UTF-8 is
+/// still a usable path, and turning it into a `String` (as [`run`] has to) would
+/// either panic or mangle it, so nothing here round-trips an argument through
+/// `String`.
+pub fn run_os(args: &[OsString]) -> i32 {
     let cli = match parse_cli(args) {
         Ok(cli) => cli,
         Err(e) => {
@@ -2939,7 +3115,12 @@ pub fn run(args: &[String]) -> i32 {
 
     let config = load_config();
 
-    let interactive = cli.operation.is_none() && cli.paths.is_empty();
+    // Interactive mode means no arguments at all: it asks for the operation, the
+    // paths and the output directory, and takes the password from the terminal.
+    // It is one or the other, never a mix, so stray flags are a usage error here
+    // rather than a prompt that quietly eats the pipeline a caller meant as
+    // input.
+    let interactive = args.is_empty();
     if !interactive {
         if cli.operation.is_none() {
             eprintln!("Error: specify -e/-E (encrypt) or -d/-D (decrypt).");
@@ -3423,6 +3604,33 @@ mod tests {
         assert!(err.to_string().contains("empty chunk"), "{err}");
     }
 
+    #[test]
+    fn a_wrong_key_length_is_an_error_not_a_panic() {
+        // One byte short: this used to reach `Key::from_slice`, which panics.
+        let short = [0x11u8; KEY_SIZE - 1];
+
+        let err = aes_encrypt(b"payload", &short, b"").unwrap_err();
+        assert!(
+            err.to_string().contains("must be 32 bytes, got 31"),
+            "{err}"
+        );
+
+        // Long enough to get past the length check that runs first.
+        let ciphertext = vec![0u8; NONCE_SIZE + GCM_TAG_SIZE];
+        let err = aes_decrypt(&ciphertext, &short, b"").unwrap_err();
+        assert!(
+            err.to_string().contains("must be 32 bytes, got 31"),
+            "{err}"
+        );
+
+        // And the right length still round trips, so the check is not simply
+        // rejecting everything.
+        let key = [0x22u8; KEY_SIZE];
+        let encrypted = aes_encrypt(b"payload", &key, b"aad").unwrap();
+        let decrypted = aes_decrypt(&encrypted, &key, b"aad").unwrap();
+        assert_eq!(decrypted.to_vec(), b"payload");
+    }
+
     fn scratch_dir(tag: &str) -> PathBuf {
         let mut suffix = [0u8; 4];
         OsRng.fill_bytes(&mut suffix);
@@ -3588,6 +3796,36 @@ mod tests {
     }
 
     #[test]
+    fn cli_keeps_non_utf8_arguments_intact() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let args = vec![
+            OsString::from("-e"),
+            OsString::from_vec(b"bad\xffname".to_vec()),
+            OsString::from_vec(b"--output=/tmp/out\xff".to_vec()),
+        ];
+        let cli = parse_cli(&args).unwrap();
+        assert_eq!(
+            cli.paths,
+            vec![PathBuf::from(OsString::from_vec(b"bad\xffname".to_vec()))]
+        );
+        assert_eq!(
+            cli.output,
+            Some(PathBuf::from(OsString::from_vec(b"/tmp/out\xff".to_vec())))
+        );
+
+        // A flag whose value is a number has to be UTF-8, and says so instead of
+        // quietly parsing something else.
+        let args = vec![
+            OsString::from("--workers"),
+            OsString::from_vec(b"4\xff".to_vec()),
+            OsString::from("-e"),
+            OsString::from("a"),
+        ];
+        assert!(parse_cli(&args).is_err());
+    }
+
+    #[test]
     fn kdf_param_bounds_are_enforced_without_panicking() {
         assert!(validate_kdf_params(HEADER_ARGON2_MEM_COST, 12, 2).is_ok());
         assert!(validate_kdf_params(0, 1, 1).is_err());
@@ -3701,23 +3939,31 @@ mod tests {
 
         // A real path containing a comma is taken literally.
         let mut paths = Vec::new();
-        push_paths(&mut paths, odd.to_str().unwrap());
+        push_paths(&mut paths, odd.as_os_str());
         assert_eq!(paths, vec![odd.clone()]);
 
         // A comma-separated argument that names nothing is still split.
         let mut paths = Vec::new();
-        push_paths(&mut paths, "a,b");
+        push_paths(&mut paths, OsStr::new("a,b"));
         assert_eq!(paths, vec![PathBuf::from("a"), PathBuf::from("b")]);
 
         // Whitespace around the parts is still trimmed.
         let mut paths = Vec::new();
-        push_paths(&mut paths, " a , b ");
+        push_paths(&mut paths, OsStr::new(" a , b "));
         assert_eq!(paths, vec![PathBuf::from("a"), PathBuf::from("b")]);
 
         // A single path is unaffected.
         let mut paths = Vec::new();
-        push_paths(&mut paths, "  /tmp/nowhere  ");
+        push_paths(&mut paths, OsStr::new("  /tmp/nowhere  "));
         assert_eq!(paths, vec![PathBuf::from("/tmp/nowhere")]);
+
+        // Bytes that are not UTF-8 stay in the path instead of being replaced.
+        let mut paths = Vec::new();
+        push_paths(&mut paths, OsStr::from_bytes(b"bad\xffname"));
+        assert_eq!(
+            paths,
+            vec![PathBuf::from(OsStr::from_bytes(b"bad\xffname"))]
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
