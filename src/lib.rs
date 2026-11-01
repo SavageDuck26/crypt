@@ -1409,6 +1409,12 @@ fn add_tree_to_tar<W: Write>(
 
     let mut walker = walkdir::WalkDir::new(source_root)
         .follow_links(false)
+        // Sorted, so the order entries go into the archive does not depend on
+        // the filesystem's directory order. That order is what decryption
+        // replays, so it decides which of two `--compat` collisions keeps the
+        // plain name and which gets `_1`; without this the rename count is
+        // filesystem-dependent.
+        .sort_by_file_name()
         .into_iter();
     while let Some(walk_entry) = walker.next() {
         let walk_entry = match walk_entry {

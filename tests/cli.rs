@@ -1128,6 +1128,9 @@ fn byte_exact_names_survive_and_compat_renames_them() {
     ];
     payloads.sort();
     assert_eq!(payloads, vec![b"colon".to_vec(), b"underscore".to_vec()]);
+    // The archive walk is sorted by file name, and `:` sorts before `_`, so
+    // `a:b` is stored first: it becomes `a_b`, and the stored `a_b` then has to
+    // make do with `a_b_1`. Both count as renamed.
     assert!(
         stderr.contains("--compat renamed 2 file(s)"),
         "the rename count should be reported: {stderr}"
