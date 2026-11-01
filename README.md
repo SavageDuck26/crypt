@@ -73,10 +73,10 @@ Encrypting from a pipe is not recommended. A wrong password when decrypting cost
 
 ## Security notes
 
-- Losing the password loses the archive. There is no recovery key, hint or back door.
+- Losing the password loses the archive. There is no recovery key, hint or back door, and there is no way to change the password without decrypting and re-encrypting: the keys are derived from the password, not wrapped by it (yet).
 - A wrong password and a tampered file are reported the same way on purpose, so the tool is not an oracle for attackers.
-- The magic, format version, salt and stream lengths are visible; the stored name, file data and end-of-stream count are inside the encrypted header, chunks and footer.
-- Each file gets a fresh 32-byte salt and its own pair of keys (header and data), derived from the password with Argon2id at the built-in settings.
+- The magic, format version, salt, total length and each chunk's compressed length are visible; that last one leaks rough per-chunk compressibility. The stored name, file data and end-of-stream count are inside the encrypted header, chunks and footer.
+- Each file gets a fresh 32-byte salt and its own pair of keys (header and data), derived from the password with Argon2id at the built-in settings. The password is NFC-normalized first.
 - Only regular files and directories are archived; symlinks are skipped rather than followed, so a link cannot pull in data from outside the tree.
 
 ## Library

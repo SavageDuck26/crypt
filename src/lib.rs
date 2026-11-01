@@ -122,6 +122,15 @@ mod messages;
 /// sites readable.
 use messages::{err, info, warn};
 
+// The AES key schedule is a copy of the data key, and it lives inside the
+// `aes-gcm` cipher. Enabling `zeroize` on both crates (see Cargo.toml) makes the
+// cipher wipe it on drop; this fails the build if a dependency change ever stops
+// enabling the `aes` half of that, which would otherwise happen silently.
+const _: fn() = || {
+    fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    assert_zeroize_on_drop::<aes::Aes256>();
+};
+
 // ---------------------------------------------------------------------------
 // Format constants
 // ---------------------------------------------------------------------------

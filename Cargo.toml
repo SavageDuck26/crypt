@@ -16,7 +16,15 @@ test-kdf = []
 
 [dependencies]
 argon2 = "0.5.3"
-aes-gcm = "0.10.3"
+# aes-gcm's own `zeroize` feature wipes the temporary GHASH key it derives. The
+# AES round keys live in `aes`, whose Drop wipes them only when its `zeroize`
+# feature is on; feature unification is global, so this direct dependency turns
+# that feature on for the copy aes-gcm builds. lib.rs asserts the arrangement so
+# a dependency change cannot undo it silently. (ghash/polyval keep derived state
+# of their own that these features do not cover, so this is defence in depth,
+# not a guarantee.)
+aes-gcm = { version = "0.10.3", features = ["zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
 # NFC for passwords: canonical equivalence only (composed vs decomposed), so the
 # same visible password derives the same key on any keyboard.
 unicode-normalization = "0.1.26"
