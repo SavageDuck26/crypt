@@ -167,14 +167,14 @@ fn every_legacy_version_still_decrypts() {
             .unwrap_or_else(|e| panic!("{label}: {e}"));
 
         if label.ends_with("file") {
-            assert_eq!(created, vec![out.join("payload.txt")], "{label}");
+            assert_eq!(created.paths, vec![out.join("payload.txt")], "{label}");
             assert_eq!(
                 fs::read(out.join("payload.txt")).unwrap(),
                 b"legacy fixture file\n",
                 "{label}"
             );
         } else {
-            assert_eq!(created, vec![out.join("payload")], "{label}");
+            assert_eq!(created.paths, vec![out.join("payload")], "{label}");
             assert_eq!(
                 fs::read(out.join("payload/a.txt")).unwrap(),
                 b"legacy fixture file\n",

@@ -66,7 +66,10 @@ fn run_in<S: AsRef<OsStr>>(
     let mut child = command.spawn().expect("spawn crypt");
     if let Some(password) = password {
         let mut stdin = child.stdin.take().unwrap();
-        writeln!(stdin, "{password}").unwrap();
+        // A refused invocation can exit before it reads stdin, which turns this
+        // write into a broken pipe. The test cares about the exit code and the
+        // output, not about delivering a password nobody asked for.
+        let _ = writeln!(stdin, "{password}");
         drop(stdin);
     } else {
         drop(child.stdin.take());
@@ -89,6 +92,42 @@ fn only_crypt_file(dir: &Path) -> PathBuf {
         .collect();
     assert_eq!(found.len(), 1, "expected exactly one .crypt in {dir:?}");
     found.pop().unwrap()
+}
+
+/// Every regular file under `dir`, recursively, sorted.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in fs::read_dir(&current).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Deterministic, incompressible bytes.
+///
+/// A test that needs more than one 16 MiB chunk must not write something Zstd
+/// can fold into a single tiny chunk, or the cut would not land where it is
+/// meant to. A xorshift is enough, and it keeps the test reproducible.
+fn noise(len: usize) -> Vec<u8> {
+    let mut state = 0x243F_6A88_85A3_08D3u64;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
 }
 
 /// Names of the entries in a directory, sorted.
@@ -547,10 +586,9 @@ fn a_failed_run_keeps_a_recoverable_partial_archive() {
 
     let out = dir.join("out");
     fs::create_dir_all(&out).unwrap();
-    let opts = crypt::EncryptOptions {
-        workers: 1,
-        level: 1,
-    };
+    let opts = crypt::EncryptOptions::default()
+        .with_workers(1)
+        .with_level(1);
     let err = crypt::encrypt_file(&[src, fifo], "correcthorse", Some(&out), &opts)
         .expect_err("packing a FIFO must fail");
     assert!(err.to_string().contains("regular file"), "{err}");
@@ -644,17 +682,16 @@ fn library_round_trip_through_the_public_api() {
     fs::write(src.join("a.txt"), b"hello").unwrap();
 
     let out = dir.join("out");
-    let opts = crypt::EncryptOptions {
-        workers: 1,
-        ..Default::default()
-    };
-    let archive = crypt::encrypt_file(
+    let opts = crypt::EncryptOptions::default().with_workers(1);
+    let outcome = crypt::encrypt_file(
         std::slice::from_ref(&src),
         "correcthorse",
         Some(&out),
         &opts,
     )
     .expect("encrypt_file");
+    assert!(outcome.is_complete());
+    let archive = outcome.archive;
 
     let dest = dir.join("dest");
     let created = crypt::decrypt_file(
@@ -664,7 +701,8 @@ fn library_round_trip_through_the_public_api() {
         &crypt::DecryptOptions::default(),
     )
     .expect("decrypt_file");
-    assert_eq!(created.len(), 1, "{created:?}");
+    assert_eq!(created.paths.len(), 1, "{created:?}");
+    assert!(created.is_complete(), "{created:?}");
     assert_eq!(fs::read(dest.join("src/a.txt")).unwrap(), b"hello");
 
     // A wrong password is an authentication failure, and writes nothing.
@@ -703,6 +741,116 @@ fn library_round_trip_through_the_public_api() {
     );
     assert!(entries(&partial_out).is_empty());
 
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// The library reports what happened through the outcome and the caller's
+/// reporter; it does not print, and an archive that is missing data says so
+/// without the caller parsing a warning.
+#[test]
+fn the_library_reports_skips_to_the_reporter_and_the_outcome() {
+    use std::sync::Mutex;
+
+    struct Capture(Mutex<Vec<String>>);
+
+    impl crypt::Reporter for Capture {
+        fn warning(&self, line: &str) {
+            self.0.lock().unwrap().push(line.to_string());
+        }
+    }
+
+    let dir = scratch("lib-report");
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("fine.txt"), b"fine").unwrap();
+    let locked = src.join("locked.txt");
+    fs::write(&locked, b"secret").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    // As root, 0o000 does not stop a read, so this machine cannot produce the
+    // case; say so by skipping rather than asserting on a lie.
+    if fs::read(&locked).is_ok() {
+        fs::remove_dir_all(&dir).ok();
+        return;
+    }
+
+    let out = dir.join("out");
+    let capture = std::sync::Arc::new(Capture(Mutex::new(Vec::new())));
+    let opts = crypt::EncryptOptions::default()
+        .with_workers(1)
+        .with_reporter(capture.clone());
+    let outcome = crypt::encrypt_file(
+        std::slice::from_ref(&src),
+        "correcthorse",
+        Some(&out),
+        &opts,
+    )
+    .expect("a readable part is still archived");
+
+    assert!(!outcome.is_complete(), "{outcome:?}");
+    assert_eq!(outcome.unreadable, 1, "{outcome:?}");
+    assert_eq!(outcome.files, 1, "{outcome:?}");
+    let lines = capture.0.lock().unwrap();
+    assert!(
+        lines.iter().any(|line| line.contains("unreadable file")),
+        "the reporter should have been told: {lines:?}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// A name that `--compat` had to change is named in the outcome, so a caller
+/// does not have to scrape warnings to find out.
+#[test]
+fn the_library_outcome_lists_entries_restored_under_another_name() {
+    let dir = scratch("lib-renamed");
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a:b"), b"colon").unwrap();
+
+    let out = dir.join("out");
+    let written = crypt::encrypt_file(
+        &[&src],
+        "correcthorse",
+        Some(&out),
+        &crypt::EncryptOptions::default().with_workers(1),
+    )
+    .expect("encrypt_file");
+
+    let dest = dir.join("dest");
+    let restored = crypt::decrypt_file(
+        &written.archive,
+        "correcthorse",
+        Some(&dest),
+        &crypt::DecryptOptions::default()
+            .with_workers(1)
+            .with_compat(true),
+    )
+    .expect("decrypt_file");
+
+    assert_eq!(restored.paths, vec![dest.join("src")], "{restored:?}");
+    assert!(
+        restored.renamed.contains(&PathBuf::from("src/a_b")),
+        "the renamed entry should be listed: {restored:?}"
+    );
+    assert!(
+        !restored.is_complete(),
+        "a rename means it did not come back under its own name"
+    );
+    assert_eq!(fs::read(dest.join("src/a_b")).unwrap(), b"colon");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// An operating-system failure keeps its `ErrorKind`, so a caller does not have
+/// to match on the message the way `Error::Other(String)` would force it to.
+#[test]
+fn a_missing_archive_is_an_io_error_with_its_kind_preserved() {
+    let dir = scratch("lib-io-kind");
+    let err = crypt::decrypt(dir.join("not-there.crypt"), "correcthorse")
+        .expect_err("a missing archive must fail");
+    assert_eq!(err.kind(), Some(std::io::ErrorKind::NotFound), "{err:?}");
+    assert!(matches!(err, crypt::Error::Io { .. }), "{err:?}");
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -845,18 +993,17 @@ fn an_absurd_worker_count_is_clamped_to_the_cap() {
 
     // The library clamps too, and it never panics on a thread count it cannot
     // start.
-    let opts = crypt::EncryptOptions {
-        workers: usize::MAX,
-        level: 1,
-    };
-    let archive = crypt::encrypt_file(
+    let opts = crypt::EncryptOptions::default()
+        .with_workers(usize::MAX)
+        .with_level(1);
+    let outcome = crypt::encrypt_file(
         std::slice::from_ref(&src),
         "correcthorse",
         Some(&out),
         &opts,
     )
     .expect("a huge worker count must be clamped, not fatal");
-    assert!(archive.exists());
+    assert!(outcome.archive.exists());
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -919,6 +1066,321 @@ fn a_lone_flag_is_a_usage_error_instead_of_an_interactive_prompt() {
     assert!(
         !stdout.contains("Enter 'e' to encrypt"),
         "nothing may be prompted for: {stdout}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Names come back byte for byte by default. `--compat` is the opt-in that maps
+/// characters exFAT/Win32 refuses, and when it makes two names collide the
+/// second is suffixed rather than written over the first.
+#[test]
+fn byte_exact_names_survive_and_compat_renames_them() {
+    let dir = scratch("names");
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a:b"), b"colon").unwrap();
+    fs::write(src.join("a_b"), b"underscore").unwrap();
+
+    let out = dir.join("out");
+    let archive = encrypt(&dir, &src, &out, "correcthorse");
+
+    // The default restore keeps both names exactly as they went in.
+    let exact = dir.join("exact");
+    let (code, _, stderr) = decrypt(&dir, &archive, &exact, "correcthorse");
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        entries(&exact.join("src")),
+        vec!["a:b".to_string(), "a_b".to_string()]
+    );
+    assert_eq!(fs::read(exact.join("src/a:b")).unwrap(), b"colon");
+    assert_eq!(fs::read(exact.join("src/a_b")).unwrap(), b"underscore");
+    // ... and says the names will not survive a trip through such a filesystem.
+    assert!(
+        stderr.contains("exFAT"),
+        "the incompatible name should be reported: {stderr}"
+    );
+
+    // `--compat` maps `a:b` onto `a_b`, which is already taken, so one of them
+    // gets a suffix and both payloads survive.
+    let compat = dir.join("compat");
+    fs::create_dir_all(&compat).unwrap();
+    let (code, _, stderr) = run_in(
+        &dir,
+        &[
+            "-d",
+            archive.to_str().unwrap(),
+            "--output",
+            compat.to_str().unwrap(),
+            "--compat",
+            "--password-stdin",
+        ],
+        Some("correcthorse"),
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        entries(&compat.join("src")),
+        vec!["a_b".to_string(), "a_b_1".to_string()]
+    );
+    let mut payloads = vec![
+        fs::read(compat.join("src/a_b")).unwrap(),
+        fs::read(compat.join("src/a_b_1")).unwrap(),
+    ];
+    payloads.sort();
+    assert_eq!(payloads, vec![b"colon".to_vec(), b"underscore".to_vec()]);
+    assert!(
+        stderr.contains("--compat renamed 2 file(s)"),
+        "the rename count should be reported: {stderr}"
+    );
+
+    // On the encrypt side it is a no-op, and says so.
+    let ignore = dir.join("ignore");
+    fs::create_dir_all(&ignore).unwrap();
+    let (code, _, stderr) = run_in(
+        &dir,
+        &[
+            "-e",
+            src.to_str().unwrap(),
+            "--output",
+            ignore.to_str().unwrap(),
+            "--compat",
+            "--level",
+            "1",
+            "--password-stdin",
+        ],
+        Some("correcthorse"),
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("--compat has no effect when encrypting"),
+        "{stderr}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// A Unicode password works, and the composed and decomposed spellings of it are
+/// the same password: NFC is applied on both sides.
+#[test]
+fn a_unicode_password_round_trips_and_is_nfc_normalized() {
+    let dir = scratch("unicode-pw");
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"hello").unwrap();
+
+    // Composed on the way in ("é" as one code point)...
+    let out = dir.join("out");
+    let archive = encrypt(&dir, &src, &out, "pässwörd12");
+
+    // ... decomposed on the way out ("e" plus a combining acute).
+    let dest = dir.join("dest");
+    let (code, _, stderr) = decrypt(&dir, &archive, &dest, "pa\u{308}sswo\u{308}rd12");
+    assert_eq!(
+        code, 0,
+        "the same visible password in another normalization must open it: {stderr}"
+    );
+    assert_eq!(fs::read(dest.join("src/a.txt")).unwrap(), b"hello");
+
+    // A genuinely different password is still refused.
+    let wrong = dir.join("wrong");
+    let (code, _, _) = decrypt(&dir, &archive, &wrong, "passwörd12");
+    assert_ne!(code, 0);
+    assert!(entries(&wrong).is_empty(), "{:?}", entries(&wrong));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// `compat = true` in the config is the same switch as `--compat`, for a machine
+/// that always restores onto an exFAT drive.
+#[test]
+fn the_compat_config_key_does_the_same_as_the_flag() {
+    let dir = scratch("config-compat");
+    let src = dir.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a:b"), b"colon").unwrap();
+
+    let out = dir.join("out");
+    let archive = encrypt(&dir, &src, &out, "correcthorse");
+
+    // `run_in` points CRYPT_CONFIG at a file beside the scratch directory, so
+    // writing it there is what a user with the setting would have.
+    let config = dir.with_file_name(format!(
+        "{}.toml",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    fs::write(&config, "compat = true\n").unwrap();
+
+    let dest = dir.join("dest");
+    let (code, _, stderr) = decrypt(&dir, &archive, &dest, "correcthorse");
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(entries(&dest.join("src")), vec!["a_b".to_string()]);
+    assert_eq!(fs::read(dest.join("src/a_b")).unwrap(), b"colon");
+    assert!(
+        stderr.contains("--compat renamed 1 file(s)"),
+        "the rename should be reported: {stderr}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// A `--compat` collision is handled at every depth: two directories and two
+/// files that only clash because of the rename all keep their contents.
+#[test]
+fn compat_suffixes_collisions_at_every_depth() {
+    let dir = scratch("names-nested");
+    let src = dir.join("src");
+    fs::create_dir_all(src.join("d:ir")).unwrap();
+    fs::create_dir_all(src.join("d_ir")).unwrap();
+    fs::write(src.join("d:ir/a:b"), b"nested colon").unwrap();
+    fs::write(src.join("d:ir/a_b"), b"nested underscore").unwrap();
+    fs::write(src.join("d_ir/kept.txt"), b"other dir").unwrap();
+
+    let out = dir.join("out");
+    let archive = encrypt(&dir, &src, &out, "correcthorse");
+
+    let dest = dir.join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let (code, _, stderr) = run_in(
+        &dir,
+        &[
+            "-d",
+            archive.to_str().unwrap(),
+            "--output",
+            dest.to_str().unwrap(),
+            "--compat",
+            "--password-stdin",
+        ],
+        Some("correcthorse"),
+    );
+    assert_eq!(code, 0, "{stderr}");
+
+    // `d:ir` and `d_ir` both map to `d_ir`, so one of them is suffixed...
+    assert_eq!(
+        entries(&dest.join("src")),
+        vec!["d_ir".to_string(), "d_ir_1".to_string()]
+    );
+    // ... and all three payloads are still there, which is the whole point.
+    let mut payloads: Vec<Vec<u8>> = files_under(&dest.join("src"))
+        .iter()
+        .map(|path| fs::read(path).unwrap())
+        .collect();
+    payloads.sort();
+    assert_eq!(
+        payloads,
+        vec![
+            b"nested colon".to_vec(),
+            b"nested underscore".to_vec(),
+            b"other dir".to_vec()
+        ]
+    );
+
+    // The directory holding the pair has `a_b` and `a_b_1`, not one file.
+    let pair_dir = files_under(&dest.join("src"))
+        .into_iter()
+        .find(|path| path.file_name().map(|n| n == "a_b" || n == "a_b_1") == Some(true))
+        .expect("the renamed pair should be on disk");
+    assert_eq!(
+        entries(pair_dir.parent().unwrap()),
+        vec!["a_b".to_string(), "a_b_1".to_string()]
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// A `.coffin` cut inside a later chunk keeps everything that finished and drops
+/// the one file the cut ran through. Two inputs, so the first chunk holds one
+/// whole file and the cut lands in the second chunk's data.
+#[test]
+fn a_coffin_cut_inside_a_chunk_keeps_intact_files_and_drops_the_cut_one() {
+    let dir = scratch("coffin-chunks");
+    fs::write(dir.join("aaa.txt"), b"hello").unwrap();
+    // More than one 16 MiB chunk, and incompressible, so the second chunk really
+    // is second.
+    fs::write(dir.join("zzz.bin"), noise(17 * 1024 * 1024 + 4096)).unwrap();
+
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let (code, _, stderr) = run_in(
+        &dir,
+        &[
+            "-e",
+            "aaa.txt,zzz.bin",
+            "--output",
+            out.to_str().unwrap(),
+            "--level",
+            "1",
+            "--password-stdin",
+        ],
+        Some("correcthorse"),
+    );
+    assert_eq!(code, 0, "encrypt failed: {stderr}");
+    let archive = only_crypt_file(&out);
+
+    // Drop the last 512 KiB: the trailer and the tail of the second chunk.
+    let bytes = fs::read(&archive).unwrap();
+    let partial = out.join("cut.coffin");
+    fs::write(&partial, &bytes[..bytes.len() - 512 * 1024]).unwrap();
+
+    let dest = dir.join("dest");
+    let (code, _, stderr) = decrypt(&dir, &partial, &dest, "correcthorse");
+    assert_eq!(code, 0, "recovery failed: {stderr}");
+    assert_eq!(fs::read(dest.join("aaa.txt")).unwrap(), b"hello");
+    assert!(
+        !dest.join("zzz.bin").exists(),
+        "the file the cut ran through must not be kept: {:?}",
+        entries(&dest)
+    );
+    assert!(
+        stderr.contains("zzz.bin"),
+        "the dropped entry should be named: {stderr}"
+    );
+    assert!(stderr.contains("partial"), "{stderr}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// The same cut in a single-file archive leaves nothing to recover: the one file
+/// it holds was never written in full, so crypt says so instead of printing an
+/// empty "Decrypted into:" line.
+#[test]
+fn a_coffin_cut_inside_its_only_file_recovers_nothing() {
+    let dir = scratch("coffin-single");
+    fs::write(dir.join("only.bin"), noise(17 * 1024 * 1024 + 4096)).unwrap();
+
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let (code, _, stderr) = run_in(
+        &dir,
+        &[
+            "-e",
+            "only.bin",
+            "--output",
+            out.to_str().unwrap(),
+            "--level",
+            "1",
+            "--password-stdin",
+        ],
+        Some("correcthorse"),
+    );
+    assert_eq!(code, 0, "encrypt failed: {stderr}");
+    let archive = only_crypt_file(&out);
+
+    let bytes = fs::read(&archive).unwrap();
+    let partial = out.join("only.coffin");
+    fs::write(&partial, &bytes[..bytes.len() - 512 * 1024]).unwrap();
+
+    let dest = dir.join("dest");
+    let (code, stdout, stderr) = decrypt(&dir, &partial, &dest, "correcthorse");
+    assert_eq!(code, 0, "a .coffin is recovered, not refused: {stderr}");
+    assert!(
+        stdout.contains("Nothing recovered"),
+        "an empty result must be said out loud: {stdout}"
+    );
+    assert!(!stdout.contains("Decrypted into"), "{stdout}");
+    assert_eq!(entries(&dest), Vec::<String>::new());
+    assert!(
+        stderr.contains("only.bin"),
+        "the dropped entry should be named: {stderr}"
     );
 
     fs::remove_dir_all(&dir).ok();

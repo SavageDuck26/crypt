@@ -4,6 +4,28 @@
 //! format, framing and path logic can be unit tested without spawning a process
 //! or needing a terminal.
 //!
+//! # Quick start
+//!
+//! ```no_run
+//! // Default options, archive next to the source, nothing printed.
+//! let written = crypt::encrypt(&["/data"], "correcthorse")?;
+//!
+//! // `Ok` does not always mean "everything got in"; a file that could not be
+//! // read is counted and the archive is still valid, just incomplete.
+//! assert!(written.is_complete(), "{} file(s) unreadable", written.unreadable);
+//!
+//! let restored = crypt::decrypt(&written.archive, "correcthorse")?;
+//! for path in &restored.paths {
+//!     println!("restored {}", path.display());
+//! }
+//! # Ok::<(), crypt::Error>(())
+//! ```
+//!
+//! # Platform
+//!
+//! Unix-like systems only (Linux, macOS, the BSDs). Path handling and the
+//! clipboard-free terminal prompt both use `std::os::unix`.
+//!
 //! # Format (v5)
 //!
 //! ```text
@@ -22,21 +44,54 @@
 //!
 //! # Key schedule
 //!
-//! `master = Argon2id(password, salt, built-in params)` (64 bytes), split into
-//! two independent 32-byte keys: the header key and the data key. One KDF call
-//! per file. The parameters are built into the binary and never read from the
+//! `master = Argon2id(NFC(password), salt, built-in params)` (64 bytes), split
+//! into two independent 32-byte keys: the header key and the data key. The
+//! password is NFC-normalized UTF-8 and is allowed to be any script; NFC is the
+//! identity for ASCII, so it cannot change an existing archive's key. One KDF
+//! call per file. The parameters are built into the binary and never read from the
 //! file or the config, so there is no downgrade surface and nothing to validate.
+//!
+//! # Restoring names
+//!
+//! Decryption puts every stored name back exactly as it was. Only names that are
+//! structurally unusable are refused (`..`, an absolute path, an empty name, or a
+//! NUL or a `/` inside one), and nothing is ever written over: a name that is
+//! already taken in the destination gets a `_1`, `_2`, ... suffix.
+//!
+//! [`DecryptOptions::compat`] (the CLI's `--compat`) restores the older way
+//! instead: characters exFAT and Win32 refuse become `_`, and the suffix rule
+//! then applies at every depth, so `a:b` next to `a_b` keeps both files rather
+//! than one replacing the other.
+//!
+//! Every line the program prints lives in the private `messages` module, split
+//! into `err` (the payload of an [`Error`]), `warn` (a complete stderr line) and
+//! `info` (stdout, prompts included), so the wording can be reviewed in one
+//! place.
 //!
 //! # Public API
 //!
-//! [`encrypt_file`] and [`decrypt_file`] are the library surface, their knobs
-//! live in [`EncryptOptions`] and [`DecryptOptions`], and failures come back as
-//! a typed [`Error`]. [`run_os`] is the CLI entry point — [`run`] is the same
-//! thing for callers that only have `String`s, and the binary uses the `OsString`
-//! one so a path that is not valid UTF-8 still arrives intact. The config file is
-//! a CLI convenience that a library caller simply does not use.
+//! [`encrypt`] and [`decrypt`] are the short path: default options, output next
+//! to the input, and nothing printed. [`encrypt_file`] and [`decrypt_file`] take
+//! the knobs from [`EncryptOptions`] and [`DecryptOptions`] and return an
+//! [`EncryptOutcome`] or a [`DecryptOutcome`] describing what was written or
+//! restored: how many files, what was skipped, what came back under a different
+//! name. [`EncryptOutcome::is_complete`] and [`DecryptOutcome::is_complete`] are
+//! the quick answer to "did I get everything?".
+//!
+//! Nothing in the library writes to stdout or stderr. A caller that wants the
+//! warnings and progress the CLI shows installs a [`Reporter`] with
+//! [`EncryptOptions::with_reporter`] or [`DecryptOptions::with_reporter`].
+//!
+//! Failures come back as a typed [`Error`]; operating-system failures are
+//! [`Error::Io`] and keep the [`std::io::ErrorKind`], so a caller can tell a
+//! missing file from a permission problem without parsing the message.
+//!
+//! [`run_os`] is the CLI entry point — [`run`] is the same thing for callers
+//! that only have `String`s, and the binary uses the `OsString` one so a path
+//! that is not valid UTF-8 still arrives intact. The config file is a CLI
+//! convenience that a library caller simply does not use.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -57,8 +112,15 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use serde::Deserialize;
 use termios::{Termios, ECHO, ICANON, ISIG, TCSANOW};
+use unicode_normalization::UnicodeNormalization;
 use zeroize::{Zeroize, Zeroizing};
 use zstd::bulk::Decompressor;
+
+mod messages;
+
+/// Every user-facing line lives in [`messages`]; the short aliases keep the call
+/// sites readable.
+use messages::{err, info, warn};
 
 // ---------------------------------------------------------------------------
 // Format constants
@@ -201,6 +263,26 @@ const MIN_PASSWORD_LEN: usize = 8;
 /// Wrong password and tampering are *not* distinguished: telling them apart
 /// would turn the tool into an oracle for attackers. Both are
 /// [`Error::Authentication`].
+///
+/// The enum is `#[non_exhaustive]`; match with a `_` arm so a later variant is
+/// not a breaking change.
+///
+/// # Example
+///
+/// ```no_run
+/// match crypt::decrypt("/backup/docs.crypt", "correcthorse") {
+///     // Same variant for a wrong password and for a tampered file.
+///     Err(crypt::Error::Authentication(_)) => eprintln!("wrong password or damaged"),
+///     // A cut archive: worth retrying with `DecryptOptions::with_partial(true)`.
+///     Err(crypt::Error::Truncated(_)) => eprintln!("archive is incomplete"),
+///     // An OS failure keeps its kind, so this needs no message parsing.
+///     Err(e) if e.kind() == Some(std::io::ErrorKind::NotFound) => {
+///         eprintln!("no such archive")
+///     }
+///     Err(e) => eprintln!("{e}"),
+///     Ok(_outcome) => {}
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
@@ -219,7 +301,18 @@ pub enum Error {
     /// Authentication failed: the password was wrong, or the archive was
     /// tampered with.
     Authentication(String),
-    /// Anything else: I/O, a thread that died, an internal invariant.
+    /// An operating-system failure: opening, creating, reading, writing,
+    /// renaming, or starting a thread.
+    ///
+    /// The [`std::io::ErrorKind`] is kept so a caller can react to a missing
+    /// file, a permission problem or a full disk without parsing the message.
+    Io {
+        /// The underlying error class.
+        kind: std::io::ErrorKind,
+        /// The operator-facing message, including the OS error text.
+        message: String,
+    },
+    /// Anything else: a thread that died, or an internal invariant.
     Other(String),
 }
 
@@ -232,6 +325,19 @@ impl Error {
             | Error::Truncated(message)
             | Error::Authentication(message)
             | Error::Other(message) => message,
+            Error::Io { message, .. } => message,
+        }
+    }
+
+    /// The I/O error class, when this failure came from the operating system.
+    ///
+    /// Returns `None` for every variant but [`Error::Io`], so a caller that only
+    /// cares about the class can write `err.kind() == Some(ErrorKind::NotFound)`
+    /// instead of matching the whole enum.
+    pub fn kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            Error::Io { kind, .. } => Some(*kind),
+            _ => None,
         }
     }
 
@@ -251,6 +357,13 @@ impl Error {
         Error::Authentication(message.into())
     }
 
+    fn io(message: impl Into<String>, e: &io::Error) -> Error {
+        Error::Io {
+            kind: e.kind(),
+            message: message.into(),
+        }
+    }
+
     fn other(message: impl Into<String>) -> Error {
         Error::Other(message.into())
     }
@@ -268,6 +381,93 @@ impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
 // ---------------------------------------------------------------------------
+// Reporting
+// ---------------------------------------------------------------------------
+
+/// Where [`encrypt_file`] and [`decrypt_file`] send the things the CLI prints:
+/// the occasional warning, the "what was skipped" summary, and progress.
+///
+/// The default is to say nothing at all: the library never writes to stdout or
+/// stderr on its own, and everything a caller needs to know about the result is
+/// in [`EncryptOutcome`] and [`DecryptOutcome`]. Install a reporter with
+/// [`EncryptOptions::with_reporter`] or [`DecryptOptions::with_reporter`] when a
+/// human is watching.
+///
+/// Called from several threads, which is why this is `Send + Sync`. Every method
+/// has a no-op default, so an implementation only overrides what it wants.
+///
+/// # Calling convention
+///
+/// `info` and `warning` receive a complete line with no trailing newline, in the
+/// order the work produced it, but from whichever thread produced it: a reporter
+/// that writes to one sink should lock or use an atomic writer. `progress` and
+/// `finished` come from a single background thread, and only when
+/// [`Reporter::wants_progress`] returned `true`.
+///
+/// # Example
+///
+/// ```
+/// use crypt::{EncryptOptions, Reporter};
+/// use std::sync::Arc;
+///
+/// struct CollectWarnings;
+///
+/// impl Reporter for CollectWarnings {
+///     fn warning(&self, line: &str) {
+///         eprintln!("[crypt] {line}");
+///     }
+/// }
+///
+/// let options = EncryptOptions::default().with_reporter(Arc::new(CollectWarnings));
+/// assert_eq!(options.workers, 4);
+/// ```
+pub trait Reporter: Send + Sync {
+    /// A notice about something that did not go into or come out of the archive
+    /// but is not a failure: a skipped symlink, for instance.
+    fn info(&self, line: &str) {
+        let _ = line;
+    }
+
+    /// A problem that did not stop the operation: an unreadable file, a name
+    /// that had to be changed, a recovered partial archive.
+    ///
+    /// A warning means the result is usable but is not exactly what was asked
+    /// for; the matching counts are in the outcome as well.
+    fn warning(&self, line: &str) {
+        let _ = line;
+    }
+
+    /// Whether [`Reporter::progress`] and [`Reporter::finished`] should be
+    /// called. Defaults to `false`, so a reporter that only collects warnings
+    /// does not pay for a progress thread. The CLI returns whether stdout is a
+    /// terminal here.
+    fn wants_progress(&self) -> bool {
+        false
+    }
+
+    /// Work done so far, in bytes. Called a few times a second, and only when
+    /// [`Reporter::wants_progress`] returns `true`.
+    ///
+    /// During decryption the total is the size of the encrypted stream, while
+    /// `done` counts decompressed bytes, so `done` can pass `total`; clamp it if
+    /// the display needs a percentage.
+    fn progress(&self, done: u64, total: u64) {
+        let _ = (done, total);
+    }
+
+    /// The last progress update, once the operation has finished. Called exactly
+    /// once, and after the final [`Reporter::progress`] call.
+    fn finished(&self, done: u64, total: u64) {
+        let _ = (done, total);
+    }
+}
+
+/// The reporter used when a caller does not install one.
+struct SilentReporter;
+
+impl Reporter for SilentReporter {}
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
@@ -282,6 +482,9 @@ struct Config {
     pub argon2_mem_cost: u32,
     pub argon2_time_cost: u32,
     pub argon2_parallelism: u32,
+    /// Decrypt with [`DecryptOptions::compat`] unless `--compat` says otherwise.
+    /// Off by default: names come back exactly as they went in.
+    pub compat: bool,
 }
 
 impl Default for Config {
@@ -292,6 +495,7 @@ impl Default for Config {
             argon2_mem_cost: HEADER_ARGON2_MEM_COST,
             argon2_time_cost: HEADER_ARGON2_TIME_COST,
             argon2_parallelism: HEADER_ARGON2_PARALLELISM,
+            compat: false,
         }
     }
 }
@@ -332,7 +536,7 @@ fn config_search_paths() -> Vec<PathBuf> {
 fn parse_config(text: &str) -> Result<Config> {
     let config: Config = toml::from_str(text).map_err(|e| Error::invalid_input(e.to_string()))?;
     if config.num_workers == 0 {
-        return Err(Error::invalid_input("num_workers must be at least 1"));
+        return Err(Error::invalid_input(err::NUM_WORKERS_TOO_SMALL));
     }
     Ok(config)
 }
@@ -347,11 +551,7 @@ fn load_config() -> Config {
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) => {
-                eprintln!(
-                    "[WARN] Cannot read config '{}': {}. Using built-in defaults.",
-                    path.display(),
-                    e
-                );
+                eprintln!("{}", warn::cannot_read_config(&path, &e));
                 return Config::default();
             }
         };
@@ -361,11 +561,7 @@ fn load_config() -> Config {
                 config
             }
             Err(e) => {
-                eprintln!(
-                    "[WARN] Failed to parse config '{}': {}. Using built-in defaults.",
-                    path.display(),
-                    e
-                );
+                eprintln!("{}", warn::cannot_parse_config(&path, &e));
                 Config::default()
             }
         };
@@ -378,12 +574,8 @@ fn load_config() -> Config {
             let _ = fs::create_dir_all(parent);
         }
         match fs::write(&path, DEFAULT_CONFIG_TOML) {
-            Ok(()) => println!("Created default config: {}", path.display()),
-            Err(e) => eprintln!(
-                "[WARN] Could not write default config to '{}': {}. Using built-in defaults.",
-                path.display(),
-                e
-            ),
+            Ok(()) => println!("{}", info::created_default_config(&path)),
+            Err(e) => eprintln!("{}", warn::cannot_write_default_config(&path, &e)),
         }
     }
     Config::default()
@@ -393,21 +585,18 @@ fn load_config() -> Config {
 /// silently ignoring a user's security settings.
 fn warn_ignored_kdf_settings(config: &Config, path: &Path) {
     let defaults = Config::default();
-    let changed = config.argon2_mem_cost != defaults.argon2_mem_cost
-        || config.argon2_time_cost != defaults.argon2_time_cost
-        || config.argon2_parallelism != defaults.argon2_parallelism;
-    if changed {
-        eprintln!(
-            "[WARN] '{}' sets argon2_* options ({}, {}, {}); they are fixed at ({}, {}, {}) by the \
-             file format and will be ignored. They still apply when reading v1 archives.",
-            path.display(),
-            config.argon2_mem_cost,
-            config.argon2_time_cost,
-            config.argon2_parallelism,
-            defaults.argon2_mem_cost,
-            defaults.argon2_time_cost,
-            defaults.argon2_parallelism,
-        );
+    let changed = (
+        config.argon2_mem_cost,
+        config.argon2_time_cost,
+        config.argon2_parallelism,
+    );
+    let fixed = (
+        defaults.argon2_mem_cost,
+        defaults.argon2_time_cost,
+        defaults.argon2_parallelism,
+    );
+    if changed != fixed {
+        eprintln!("{}", warn::argon2_settings_ignored(path, changed, fixed));
     }
 }
 
@@ -425,8 +614,11 @@ struct FileKeys {
 /// (which legacy files and config values can supply).
 fn build_argon2(mem_cost: u32, time_cost: u32, parallelism: u32) -> Result<Argon2<'static>> {
     let params = Params::new(mem_cost, time_cost, parallelism, None).map_err(|e| {
-        Error::other(format!(
-            "invalid Argon2id parameters ({mem_cost}, {time_cost}, {parallelism}): {e}"
+        Error::other(err::invalid_argon2_params(
+            mem_cost,
+            time_cost,
+            parallelism,
+            &e,
         ))
     })?;
     Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
@@ -443,7 +635,7 @@ fn derive_single_key(
     let mut key = Zeroizing::new([0u8; KEY_SIZE]);
     build_argon2(mem_cost, time_cost, parallelism)?
         .hash_password_into(password.as_bytes(), salt, key.as_mut())
-        .map_err(|e| Error::other(format!("key derivation failed: {e}")))?;
+        .map_err(|e| Error::other(err::key_derivation_failed(&e)))?;
     Ok(key)
 }
 
@@ -460,7 +652,7 @@ fn derive_keys(password: &str, salt: &[u8; SALT_SIZE]) -> Result<FileKeys> {
         HEADER_ARGON2_PARALLELISM,
     )?
     .hash_password_into(password.as_bytes(), salt, master.as_mut())
-    .map_err(|e| Error::other(format!("key derivation failed: {e}")))?;
+    .map_err(|e| Error::other(err::key_derivation_failed(&e)))?;
 
     let mut header = Zeroizing::new([0u8; KEY_SIZE]);
     let mut data = Zeroizing::new([0u8; KEY_SIZE]);
@@ -479,12 +671,7 @@ fn derive_keys(password: &str, salt: &[u8; SALT_SIZE]) -> Result<FileKeys> {
 /// [`KEY_SIZE`] bytes, but reporting rather than aborting is what keeps the
 /// library's side of the bargain: bad input is an error, never a panic.
 fn cipher_for(key: &[u8]) -> Result<Aes256Gcm> {
-    Aes256Gcm::new_from_slice(key).map_err(|_| {
-        Error::other(format!(
-            "internal error: the AES-GCM key must be {KEY_SIZE} bytes, got {}",
-            key.len()
-        ))
-    })
+    Aes256Gcm::new_from_slice(key).map_err(|_| Error::other(err::wrong_key_length(key.len())))
 }
 
 fn aes_encrypt(data: &[u8], key: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
@@ -492,7 +679,7 @@ fn aes_encrypt(data: &[u8], key: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let ciphertext = cipher
         .encrypt(&nonce, Payload { msg: data, aad })
-        .map_err(|e| Error::other(format!("AES-GCM encryption failed: {e}")))?;
+        .map_err(|e| Error::other(err::aes_encrypt_failed(&e)))?;
     let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
     result.extend_from_slice(&nonce);
     result.extend_from_slice(&ciphertext);
@@ -501,7 +688,7 @@ fn aes_encrypt(data: &[u8], key: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
 
 fn aes_decrypt(encrypted: &[u8], key: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if encrypted.len() < NONCE_SIZE + GCM_TAG_SIZE {
-        return Err(Error::malformed("ciphertext is too short"));
+        return Err(Error::malformed(err::CIPHERTEXT_TOO_SHORT));
     }
     let nonce = &encrypted[..NONCE_SIZE];
     let ciphertext = &encrypted[NONCE_SIZE..];
@@ -515,9 +702,7 @@ fn aes_decrypt(encrypted: &[u8], key: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec
             },
         )
         .map(Zeroizing::new)
-        .map_err(|_| {
-            Error::authentication("authentication failed (wrong password or corrupted file)")
-        })
+        .map_err(|_| Error::authentication(err::AUTHENTICATION_FAILED))
 }
 
 /// AAD for a data chunk: its index as u64 LE, binding ciphertext to position so
@@ -558,11 +743,7 @@ struct HeaderInfo {
 /// Encode the v5 header plaintext: `'D'|'F' | name_len u16le | name`.
 fn encode_header_plaintext(is_directory: bool, name: &[u8]) -> Result<Vec<u8>> {
     if name.len() > u16::MAX as usize {
-        return Err(Error::invalid_input(format!(
-            "archive name is too long ({} bytes, maximum {})",
-            name.len(),
-            u16::MAX
-        )));
+        return Err(Error::invalid_input(err::archive_name_too_long(name.len())));
     }
     let mut out = Vec::with_capacity(3 + name.len());
     out.push(if is_directory { b'D' } else { b'F' });
@@ -576,25 +757,19 @@ fn encode_header_plaintext(is_directory: bool, name: &[u8]) -> Result<Vec<u8>> {
 /// clear prefix, which `read_raw_header` handles.
 fn parse_header_plaintext(plaintext: &[u8], version: u16) -> Result<HeaderInfo> {
     if plaintext.len() < 3 {
-        return Err(Error::malformed("header is too short"));
+        return Err(Error::malformed(err::HEADER_TOO_SHORT));
     }
     let is_directory = match plaintext[0] {
         b'D' => true,
         b'F' => false,
-        other => {
-            return Err(Error::malformed(format!(
-                "header has an unknown type byte 0x{other:02x}"
-            )))
-        }
+        other => return Err(Error::malformed(err::unknown_header_type(other))),
     };
     let name_len = u16::from_le_bytes([plaintext[1], plaintext[2]]) as usize;
     let name_end = 3usize
         .checked_add(name_len)
-        .ok_or_else(|| Error::malformed("header name length overflows"))?;
+        .ok_or_else(|| Error::malformed(err::HEADER_NAME_LENGTH_OVERFLOWS))?;
     if plaintext.len() < name_end {
-        return Err(Error::malformed(
-            "header is shorter than its declared name length",
-        ));
+        return Err(Error::malformed(err::HEADER_NAME_TRUNCATED));
     }
     let name = plaintext[3..name_end].to_vec();
 
@@ -602,7 +777,7 @@ fn parse_header_plaintext(plaintext: &[u8], version: u16) -> Result<HeaderInfo> 
         let start = name_end;
         let end = start + 12;
         if plaintext.len() < end {
-            return Err(Error::malformed("header is missing its KDF parameters"));
+            return Err(Error::malformed(err::HEADER_MISSING_KDF));
         }
         let p = &plaintext[start..end];
         Some((
@@ -625,20 +800,13 @@ fn parse_header_plaintext(plaintext: &[u8], version: u16) -> Result<HeaderInfo> 
 /// a tampered header cannot exhaust memory or CPU.
 fn validate_kdf_params(mem_cost: u32, time_cost: u32, parallelism: u32) -> Result<()> {
     if !(MIN_ARGON2_MEM_COST..=MAX_ARGON2_MEM_COST).contains(&mem_cost) {
-        return Err(Error::malformed(format!(
-            "mem_cost {mem_cost} is out of range ({}..={} KiB)",
-            MIN_ARGON2_MEM_COST, MAX_ARGON2_MEM_COST
-        )));
+        return Err(Error::malformed(err::mem_cost_out_of_range(mem_cost)));
     }
     if !(1..=MAX_ARGON2_TIME_COST).contains(&time_cost) {
-        return Err(Error::malformed(format!(
-            "time_cost {time_cost} is out of range (1..={MAX_ARGON2_TIME_COST})"
-        )));
+        return Err(Error::malformed(err::time_cost_out_of_range(time_cost)));
     }
     if !(1..=MAX_ARGON2_PARALLELISM).contains(&parallelism) {
-        return Err(Error::malformed(format!(
-            "parallelism {parallelism} is out of range (1..={MAX_ARGON2_PARALLELISM})"
-        )));
+        return Err(Error::malformed(err::parallelism_out_of_range(parallelism)));
     }
     Ok(())
 }
@@ -663,33 +831,30 @@ fn read_raw_header<R: Read>(reader: &mut R) -> Result<RawHeader> {
     let mut magic = [0u8; 4];
     reader
         .read_exact(&mut magic)
-        .map_err(|_| Error::malformed("file is too short to be a crypt archive"))?;
+        .map_err(|_| Error::malformed(err::FILE_TOO_SHORT))?;
     if &magic != CRYPT_MAGIC {
-        return Err(Error::malformed("bad magic: not a crypt archive"));
+        return Err(Error::malformed(err::BAD_MAGIC));
     }
 
     let mut version_bytes = [0u8; 2];
     reader
         .read_exact(&mut version_bytes)
-        .map_err(|_| Error::truncated("file is truncated (missing version)"))?;
+        .map_err(|_| Error::truncated(err::MISSING_VERSION))?;
     let version = u16::from_le_bytes(version_bytes);
     if !(MIN_READABLE_VERSION..=CRYPT_VERSION).contains(&version) {
-        return Err(Error::malformed(format!(
-            "unsupported format version {version} (this build reads \
-             {MIN_READABLE_VERSION}..={CRYPT_VERSION})"
-        )));
+        return Err(Error::malformed(err::unsupported_version(version)));
     }
 
     let mut salt = [0u8; SALT_SIZE];
     reader
         .read_exact(&mut salt)
-        .map_err(|_| Error::truncated("file is truncated (missing salt)"))?;
+        .map_err(|_| Error::truncated(err::MISSING_SALT))?;
 
     let clear_kdf = if version == 2 {
         let mut p = [0u8; 12];
         reader
             .read_exact(&mut p)
-            .map_err(|_| Error::truncated("file is truncated (missing KDF parameters)"))?;
+            .map_err(|_| Error::truncated(err::MISSING_KDF_PARAMS))?;
         Some((
             u32::from_le_bytes([p[0], p[1], p[2], p[3]]),
             u32::from_le_bytes([p[4], p[5], p[6], p[7]]),
@@ -702,13 +867,13 @@ fn read_raw_header<R: Read>(reader: &mut R) -> Result<RawHeader> {
     let mut len_bytes = [0u8; 2];
     reader
         .read_exact(&mut len_bytes)
-        .map_err(|_| Error::truncated("file is truncated (missing header)"))?;
+        .map_err(|_| Error::truncated(err::MISSING_HEADER))?;
     let header_len = u16::from_le_bytes(len_bytes) as usize;
 
     let mut encrypted = vec![0u8; header_len];
     reader
         .read_exact(&mut encrypted)
-        .map_err(|_| Error::truncated("file is truncated (header is incomplete)"))?;
+        .map_err(|_| Error::truncated(err::HEADER_INCOMPLETE))?;
 
     let header_skip =
         4 + 2 + SALT_SIZE as u64 + clear_kdf.map_or(0, |_| 12) + 2 + header_len as u64;
@@ -734,11 +899,8 @@ fn authenticate_header(
     legacy_kdf: (u32, u32, u32),
 ) -> Result<HeaderInfo> {
     let aad = header_aad(raw.version, &raw.salt);
-    let plaintext = aes_decrypt(&raw.encrypted, header_key, &aad).map_err(|_| {
-        Error::authentication(
-            "header authentication failed: wrong password, or the header was tampered with",
-        )
-    })?;
+    let plaintext = aes_decrypt(&raw.encrypted, header_key, &aad)
+        .map_err(|_| Error::authentication(err::HEADER_NOT_AUTHENTIC))?;
 
     let info = parse_header_plaintext(&plaintext, raw.version)?;
 
@@ -756,6 +918,73 @@ fn authenticate_header(
     }
 
     Ok(info)
+}
+
+/// Derive the keys for `raw`'s claimed version and authenticate the header,
+/// returning the header's contents and the data key.
+///
+/// Split out of [`decrypt_file`] so the compatibility retry can run it twice: once
+/// with the NFC form of the password and, only when that fails and NFC actually
+/// changed the text, once with the password exactly as it was given.
+fn unlock_header(
+    raw: &RawHeader,
+    password: &str,
+    legacy_kdf: (u32, u32, u32),
+) -> Result<(HeaderInfo, Zeroizing<[u8; KEY_SIZE]>)> {
+    // v5 uses one KDF call for both keys; v1–v4 used a single key (or two, with
+    // the data params in the header).
+    let mut data_key = None;
+    let header_key = if raw.version >= VERSION_AUTHENTICATED_HEADER {
+        let keys = derive_keys(password, &raw.salt)?;
+        data_key = Some(keys.data);
+        keys.header
+    } else if raw.version >= 3 {
+        derive_single_key(
+            password,
+            &raw.salt,
+            HEADER_ARGON2_MEM_COST,
+            HEADER_ARGON2_TIME_COST,
+            HEADER_ARGON2_PARALLELISM,
+        )?
+    } else if raw.version == 2 {
+        let (mem, time, par) = raw
+            .clear_kdf
+            .ok_or_else(|| Error::malformed(err::V2_MISSING_KDF))?;
+        validate_kdf_params(mem, time, par)?;
+        let key = derive_single_key(password, &raw.salt, mem, time, par)?;
+        data_key = Some(key.clone());
+        key
+    } else {
+        // v1 stored no KDF parameters at all: the caller's settings decide.
+        let (mem, time, par) = legacy_kdf;
+        validate_kdf_params(mem, time, par)?;
+        let key = derive_single_key(password, &raw.salt, mem, time, par)?;
+        data_key = Some(key.clone());
+        key
+    };
+
+    let info = authenticate_header(raw, &header_key[..], legacy_kdf)?;
+
+    let data_key = match data_key {
+        Some(key) => key,
+        None => match info.kdf {
+            // v3/v4: if the data used the built-in params the header key is it.
+            Some((mem, time, par))
+                if (mem, time, par)
+                    == (
+                        HEADER_ARGON2_MEM_COST,
+                        HEADER_ARGON2_TIME_COST,
+                        HEADER_ARGON2_PARALLELISM,
+                    ) =>
+            {
+                header_key.clone()
+            }
+            Some((mem, time, par)) => derive_single_key(password, &raw.salt, mem, time, par)?,
+            None => header_key.clone(),
+        },
+    };
+
+    Ok((info, data_key))
 }
 
 // ---------------------------------------------------------------------------
@@ -788,28 +1017,21 @@ fn read_chunk_frame<R: Read>(
     match reader.read_exact(&mut len_bytes) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            return Err(Error::truncated(
-                "file is truncated: the end-of-stream trailer is missing, so the data \
-                        may be incomplete",
-            ));
+            return Err(Error::truncated(err::TRAILER_MISSING));
         }
-        Err(e) => return Err(Error::other(format!("read failed: {e}"))),
+        Err(e) => return Err(Error::io(err::read_failed(&e), &e)),
     }
     let pt_len = u32::from_le_bytes(len_bytes);
 
     if pt_len == CATACOMB_MARKER {
         let mut buf = [0u8; NONCE_SIZE + 8 + GCM_TAG_SIZE];
-        reader.read_exact(&mut buf).map_err(|_| {
-            Error::truncated("file is truncated: the end-of-stream trailer is incomplete")
-        })?;
-        let plaintext = aes_decrypt(&buf, key, CATACOMB_AAD).map_err(|_| {
-            Error::authentication("the end-of-stream trailer failed authentication: the file is truncated or tampered \
-             with")
-        })?;
+        reader
+            .read_exact(&mut buf)
+            .map_err(|_| Error::truncated(err::TRAILER_INCOMPLETE))?;
+        let plaintext = aes_decrypt(&buf, key, CATACOMB_AAD)
+            .map_err(|_| Error::authentication(err::TRAILER_NOT_AUTHENTIC))?;
         if plaintext.len() != 8 {
-            return Err(Error::malformed(
-                "the end-of-stream trailer has an unexpected size",
-            ));
+            return Err(Error::malformed(err::TRAILER_ODD_SIZE));
         }
         let mut count = [0u8; 8];
         count.copy_from_slice(&plaintext);
@@ -820,9 +1042,7 @@ fn read_chunk_frame<R: Read>(
 
     if pt_len == LEGACY_TRAILER {
         if !allow_legacy_trailer {
-            return Err(Error::truncated(
-                "file is truncated: an authenticated end-of-stream trailer was expected",
-            ));
+            return Err(Error::truncated(err::EXPECTED_TRAILER));
         }
         return Ok(ChunkFrame::End { total_chunks: None });
     }
@@ -830,20 +1050,17 @@ fn read_chunk_frame<R: Read>(
     let pt_len = pt_len as usize;
     let max = max_chunk_pt_len();
     if pt_len > max {
-        return Err(Error::malformed(format!(
-            "chunk {index} declares an impossible length ({pt_len} bytes; the maximum is {max})"
+        return Err(Error::malformed(err::chunk_length_impossible(
+            index, pt_len, max,
         )));
     }
 
     let mut buf = vec![0u8; NONCE_SIZE + pt_len + GCM_TAG_SIZE];
     reader
         .read_exact(&mut buf)
-        .map_err(|_| Error::truncated(format!("file is truncated: chunk {index} is incomplete")))?;
-    let plaintext = aes_decrypt(&buf, key, &chunk_aad(index)).map_err(|_| {
-        Error::authentication(format!(
-            "chunk {index} failed authentication (wrong password, reordering or corruption)"
-        ))
-    })?;
+        .map_err(|_| Error::truncated(err::chunk_incomplete(index)))?;
+    let plaintext = aes_decrypt(&buf, key, &chunk_aad(index))
+        .map_err(|_| Error::authentication(err::chunk_auth_failed(index)))?;
     Ok(ChunkFrame::Data { plaintext })
 }
 
@@ -855,31 +1072,26 @@ fn write_chunk_frame<W: Write>(
     compressed: &[u8],
 ) -> Result<()> {
     if compressed.is_empty() {
-        return Err(Error::other(
-            "internal error: refusing to write an empty chunk",
-        ));
+        return Err(Error::other(err::EMPTY_CHUNK));
     }
     if compressed.len() > max_chunk_pt_len() {
-        return Err(Error::other(format!(
-            "compressor produced an oversized chunk ({} bytes)",
-            compressed.len()
-        )));
+        return Err(Error::other(err::oversized_chunk(compressed.len())));
     }
     let ciphertext = aes_encrypt(compressed, key, &chunk_aad(index))?;
     out.write_all(&(compressed.len() as u32).to_le_bytes())
-        .map_err(|e| Error::other(format!("write failed: {e}")))?;
+        .map_err(|e| Error::io(err::write_failed(&e), &e))?;
     out.write_all(&ciphertext)
-        .map_err(|e| Error::other(format!("write failed: {e}")))?;
+        .map_err(|e| Error::io(err::write_failed(&e), &e))?;
     Ok(())
 }
 
 /// Write the authenticated end-of-stream trailer recording the chunk count.
 fn write_trailer<W: Write>(out: &mut W, key: &[u8], total_chunks: u64) -> Result<()> {
     out.write_all(&CATACOMB_MARKER.to_le_bytes())
-        .map_err(|e| Error::other(format!("write failed: {e}")))?;
+        .map_err(|e| Error::io(err::write_failed(&e), &e))?;
     let ciphertext = aes_encrypt(&total_chunks.to_le_bytes(), key, CATACOMB_AAD)?;
     out.write_all(&ciphertext)
-        .map_err(|e| Error::other(format!("write failed: {e}")))?;
+        .map_err(|e| Error::io(err::write_failed(&e), &e))?;
     Ok(())
 }
 
@@ -889,9 +1101,8 @@ fn write_trailer<W: Write>(out: &mut W, key: &[u8], total_chunks: u64) -> Result
 /// chunk is simply missing and nothing notices.
 fn verify_chunk_count(declared: Option<u64>, read: u64) -> Result<()> {
     match declared {
-        Some(declared) if declared != read => Err(Error::truncated(format!(
-            "file is truncated: the end-of-stream trailer declares {declared} chunk(s) but {read} \
-             were read"
+        Some(declared) if declared != read => Err(Error::truncated(err::trailer_count_mismatch(
+            declared, read,
         ))),
         _ => Ok(()),
     }
@@ -908,7 +1119,7 @@ fn write_header<W: Write>(
     let plaintext = encode_header_plaintext(is_directory, name)?;
     let encrypted = aes_encrypt(&plaintext, header_key, &header_aad(CRYPT_VERSION, salt))?;
     if encrypted.len() > u16::MAX as usize {
-        return Err(Error::invalid_input("header is too large to encode"));
+        return Err(Error::invalid_input(err::HEADER_TOO_LARGE));
     }
 
     out.write_all(CRYPT_MAGIC).map_err(write_err)?;
@@ -923,17 +1134,34 @@ fn write_header<W: Write>(
 }
 
 fn write_err(e: io::Error) -> Error {
-    Error::other(format!("write failed: {e}"))
+    Error::io(err::write_failed(&e), &e)
 }
 
 // ---------------------------------------------------------------------------
 // Names and paths
 // ---------------------------------------------------------------------------
 
-/// Map characters that are illegal on exFAT/Win32 to '_'.
+/// Characters no mode accepts in a path component: an empty name, `.`, `..`, or
+/// a name carrying a separator or a NUL.
+///
+/// These checks are structural rather than cosmetic, which is why they run in
+/// both modes: `..` or an absolute path would escape the destination, and a `/`
+/// inside a component would change the shape of the tree. `--compat` cannot be
+/// used to smuggle one through.
+fn component_is_usable(name: &[u8]) -> bool {
+    !name.is_empty() && name != b"." && name != b".." && !name.contains(&b'/') && !name.contains(&0)
+}
+
+/// Map characters that are illegal on exFAT/Win32 to '_' — only with `--compat`.
+/// Everywhere else a name is restored byte for byte, so `a:b` comes back as
+/// `a:b` instead of being quietly renamed.
+///
 /// A literal backslash becomes '_' too: components cannot contain '/', and
 /// inventing a separator inside one would change the tree's shape.
-fn sanitize_component_bytes(bytes: &[u8]) -> Vec<u8> {
+fn sanitize_component_bytes(bytes: &[u8], compat: bool) -> Vec<u8> {
+    if !compat {
+        return bytes.to_vec();
+    }
     bytes
         .iter()
         .map(|&b| match b {
@@ -944,27 +1172,31 @@ fn sanitize_component_bytes(bytes: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// True when `--compat` would change this name, i.e. when it holds a character
+/// exFAT or Win32 refuses. Used to warn that a byte-exact restore will not
+/// survive a trip through such a filesystem.
+fn would_rename_for_compat(bytes: &[u8]) -> bool {
+    sanitize_component_bytes(bytes, true) != bytes
+}
+
 /// Sanitize a single path component, or reject it.
 ///
 /// Operates on bytes so non-UTF-8 filenames survive a round trip instead of
 /// being mangled into U+FFFD (which can also collapse two distinct names).
-fn sanitize_name_bytes(name: &[u8]) -> Option<Vec<u8>> {
-    if name.is_empty() || name == b"." || name == b".." {
+fn sanitize_name_bytes(name: &[u8], compat: bool) -> Option<Vec<u8>> {
+    if !component_is_usable(name) {
         return None;
     }
-    if name.contains(&b'/') || name.contains(&0) {
-        return None;
-    }
-    Some(sanitize_component_bytes(name))
+    Some(sanitize_component_bytes(name, compat))
 }
 
 /// The on-disk name for a decrypted payload, with a fallback if the stored name
 /// is unusable.
-fn output_name_from_header(name: &[u8]) -> OsString {
-    match sanitize_name_bytes(name) {
+fn output_name_from_header(name: &[u8], compat: bool, reporter: &dyn Reporter) -> OsString {
+    match sanitize_name_bytes(name, compat) {
         Some(bytes) => OsString::from_vec(bytes),
         None => {
-            eprintln!("[WARN] Stored filename is unusable; using a fallback name.");
+            reporter.warning(warn::STORED_NAME_UNUSABLE);
             OsString::from("decrypted_output")
         }
     }
@@ -982,6 +1214,42 @@ fn unique_component(base: &Path, name: &OsStr) -> OsString {
         candidate.push(format!("_{n}"));
         if !base.join(&candidate).exists() {
             return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Pick a name not yet handed out in `dir`, using the same `_1`, `_2` scheme as
+/// [`unique_component`] and remembering what this extraction has already claimed.
+///
+/// `--compat` is what makes two stored names collide (`a:b` and `a_b` both map to
+/// `a_b`), and the rule is the same at every depth: never write over something
+/// that is already there. The `exists()` probe covers a case-insensitive
+/// filesystem, where `A` and `a` are the same name.
+fn unique_extracted_name(
+    used: &mut HashMap<PathBuf, HashSet<OsString>>,
+    dir: &Path,
+    name: OsString,
+    stored: &Path,
+    reporter: &dyn Reporter,
+) -> (OsString, bool) {
+    let taken = used.entry(dir.to_path_buf()).or_default();
+    if !taken.contains(&name) && !dir.join(&name).exists() {
+        taken.insert(name.clone());
+        return (name, false);
+    }
+    let mut n: u32 = 1;
+    loop {
+        let mut candidate = name.clone();
+        candidate.push(format!("_{n}"));
+        if !taken.contains(&candidate) && !dir.join(&candidate).exists() {
+            reporter.warning(&warn::compat_name_taken(
+                stored,
+                &name.to_string_lossy(),
+                &candidate.to_string_lossy(),
+            ));
+            taken.insert(candidate.clone());
+            return (candidate, true);
         }
         n += 1;
     }
@@ -1009,17 +1277,12 @@ fn decompress_chunk(
 ) -> Result<Vec<u8>> {
     if let Ok(Some(declared)) = zstd::zstd_safe::get_frame_content_size(data) {
         if declared > max_len as u64 {
-            return Err(Error::malformed(format!(
-                "chunk declares {declared} bytes of content, past the maximum chunk size \
-                 ({max_len} bytes); refusing what looks like a decompression bomb"
-            )));
+            return Err(Error::malformed(err::decompression_bomb(declared, max_len)));
         }
     }
-    decompressor.decompress(data, max_len).map_err(|e| {
-        Error::malformed(format!(
-            "chunk decompressed past the maximum chunk size ({max_len} bytes) or is corrupt: {e}"
-        ))
-    })
+    decompressor
+        .decompress(data, max_len)
+        .map_err(|e| Error::malformed(err::chunk_decompress_failed(max_len, &e)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1291,8 @@ fn decompress_chunk(
 
 #[derive(Default, Debug)]
 struct TarStats {
+    /// Regular files written into the archive.
+    pub files: u64,
     pub symlinks_skipped: u64,
     pub others_skipped: u64,
     /// Times the archive being written was found inside the tree being packed.
@@ -1055,40 +1320,25 @@ impl TarStats {
 /// way it always has been. Data that was *meant* to be archived and could not be
 /// is a warning on stderr, and it names the categories, because "the run
 /// finished" must not read as "the backup is complete" when it is not.
-fn report_skips(stats: &TarStats) {
+fn report_skips(stats: &TarStats, reporter: &dyn Reporter) {
     if stats.symlinks_skipped > 0 || stats.others_skipped > 0 || stats.staging_skipped > 0 {
-        println!(
-            "Skipped {} symlink(s), {} special file(s) and {} in-progress output file(s) while packing.",
-            stats.symlinks_skipped, stats.others_skipped, stats.staging_skipped
-        );
+        reporter.info(&info::skipped_while_packing(
+            stats.symlinks_skipped,
+            stats.others_skipped,
+            stats.staging_skipped,
+        ));
     }
     if !stats.lost_data() {
         return;
     }
     let mut missing = Vec::new();
     if stats.unreadable > 0 {
-        missing.push(format!(
-            "{} unreadable entr{}",
-            stats.unreadable,
-            if stats.unreadable == 1 { "y" } else { "ies" }
-        ));
+        missing.push(warn::missing_unreadable(stats.unreadable));
     }
     if stats.other_filesystem > 0 {
-        missing.push(format!(
-            "{} director{} on another filesystem",
-            stats.other_filesystem,
-            if stats.other_filesystem == 1 {
-                "y (a mount point)"
-            } else {
-                "ies (mount points)"
-            }
-        ));
+        missing.push(warn::missing_other_filesystem(stats.other_filesystem));
     }
-    eprintln!(
-        "[WARN] The archive is valid but NOT a full copy: {}. See the warnings above, fix the \
-         inputs and run crypt again if you need everything.",
-        missing.join(" and ")
-    );
+    reporter.warning(&warn::archive_not_a_full_copy(&missing));
 }
 
 /// Copy real permission bits and mtime into a tar header, and zero the ownership
@@ -1109,21 +1359,19 @@ fn add_file_to_tar<W: Write>(
     archive_path: &Path,
     source: &Path,
     stats: &mut TarStats,
+    reporter: &dyn Reporter,
 ) -> Result<()> {
     let file = match File::open(source) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!(
-                "[WARN] Skipping unreadable file '{}': {e}",
-                source.display()
-            );
+            reporter.warning(&warn::skipping_unreadable_file(source, &e));
             stats.unreadable += 1;
             return Ok(());
         }
     };
     let meta = file
         .metadata()
-        .map_err(|e| Error::other(format!("cannot stat '{}': {e}", source.display())))?;
+        .map_err(|e| Error::io(err::cannot_stat(source, &e), &e))?;
 
     let mut header = tar::Header::new_gnu();
     header.set_entry_type(tar::EntryType::Regular);
@@ -1132,13 +1380,8 @@ fn add_file_to_tar<W: Write>(
 
     builder
         .append_data(&mut header, archive_path, file.take(meta.len()))
-        .map_err(|e| {
-            Error::other(format!(
-                "failed to add '{}' to the archive: {e}. A file that changes size while it is \
-                 being read will corrupt the archive",
-                source.display()
-            ))
-        })?;
+        .map_err(|e| Error::io(err::cannot_add_file(source, &e), &e))?;
+    stats.files += 1;
     Ok(())
 }
 
@@ -1158,6 +1401,7 @@ fn add_tree_to_tar<W: Write>(
     source_root: &Path,
     staging: Option<&Path>,
     stats: &mut TarStats,
+    reporter: &dyn Reporter,
 ) -> Result<()> {
     let root_device = fs::symlink_metadata(source_root)
         .map(|meta| meta.dev())
@@ -1170,11 +1414,8 @@ fn add_tree_to_tar<W: Write>(
         let walk_entry = match walk_entry {
             Ok(entry) => entry,
             Err(e) => {
-                let path = e
-                    .path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                eprintln!("[WARN] Skipping '{}': {e}", path);
+                let path = e.path().map(Path::to_path_buf).unwrap_or_default();
+                reporter.warning(&warn::skipping(&path, &e));
                 // A tree crypt cannot read is missing data, not an oddity it
                 // never archives in the first place.
                 stats.unreadable += 1;
@@ -1196,19 +1437,13 @@ fn add_tree_to_tar<W: Write>(
         // (`crypt -e /data --output /data`). Packing it would embed a copy of the
         // archive in itself, with whatever content happened to be flushed.
         if staging.is_some_and(|staging| is_staging_file(walk_entry.path(), staging)) {
-            eprintln!(
-                "[WARN] Skipping '{}': it is the archive crypt is writing right now.",
-                walk_entry.path().display()
-            );
+            reporter.warning(&warn::skipping_staging_file(walk_entry.path()));
             stats.staging_skipped += 1;
             continue;
         }
 
         if walk_entry.file_type().is_symlink() {
-            eprintln!(
-                "[WARN] Skipping symlink '{}' (crypt archives regular files and directories only).",
-                walk_entry.path().display()
-            );
+            reporter.warning(&warn::skipping_symlink(walk_entry.path()));
             stats.symlinks_skipped += 1;
             continue;
         }
@@ -1218,7 +1453,7 @@ fn add_tree_to_tar<W: Write>(
         let meta = match fs::symlink_metadata(walk_entry.path()) {
             Ok(meta) => meta,
             Err(e) => {
-                eprintln!("[WARN] Skipping '{}': {e}", walk_entry.path().display());
+                reporter.warning(&warn::skipping(walk_entry.path(), &e));
                 stats.unreadable += 1;
                 continue;
             }
@@ -1229,12 +1464,10 @@ fn add_tree_to_tar<W: Write>(
         // entirely (as `same_file_system` used to do silently) rather than
         // archived as an empty directory, and the walk does not descend.
         if file_type.is_dir() && root_device.is_some_and(|device| meta.dev() != device) {
-            eprintln!(
-                "[WARN] Skipping '{}': it is on another filesystem (a mount point), so crypt stays \
-                 under '{}'.",
-                walk_entry.path().display(),
-                source_root.display()
-            );
+            reporter.warning(&warn::skipping_other_filesystem(
+                walk_entry.path(),
+                source_root,
+            ));
             stats.other_filesystem += 1;
             walker.skip_current_dir();
             continue;
@@ -1247,28 +1480,17 @@ fn add_tree_to_tar<W: Write>(
             apply_metadata(&mut header, &meta);
             builder
                 .append_data(&mut header, &archive_path, io::empty())
-                .map_err(|e| {
-                    Error::other(format!(
-                        "failed to add directory '{}': {e}",
-                        archive_path.display()
-                    ))
-                })?;
+                .map_err(|e| Error::io(err::cannot_add_directory(&archive_path, &e), &e))?;
         } else if file_type.is_file() {
-            add_file_to_tar(builder, &archive_path, walk_entry.path(), stats)?;
+            add_file_to_tar(builder, &archive_path, walk_entry.path(), stats, reporter)?;
         } else if file_type.is_symlink() {
             // The walk called this a regular file or a directory and the re-stat
             // called it a symlink, so the path changed underneath us: report it
             // rather than dropping the entry without a word.
-            eprintln!(
-                "[WARN] Skipping '{}': it turned into a symlink while the tree was being packed.",
-                walk_entry.path().display()
-            );
+            reporter.warning(&warn::skipping_new_symlink(walk_entry.path()));
             stats.symlinks_skipped += 1;
         } else {
-            eprintln!(
-                "[WARN] Skipping '{}': not a regular file or directory.",
-                walk_entry.path().display()
-            );
+            reporter.warning(&warn::skipping_special_file(walk_entry.path()));
             stats.others_skipped += 1;
         }
     }
@@ -1306,7 +1528,7 @@ fn archive_name_for(path: &Path) -> Result<OsString> {
     fs::canonicalize(path)
         .ok()
         .and_then(|canonical| canonical.file_name().map(OsStr::to_os_string))
-        .ok_or_else(|| Error::invalid_input(format!("'{}' has no file name", path.display())))
+        .ok_or_else(|| Error::invalid_input(err::no_file_name(path)))
 }
 
 /// True when `candidate` is the staging file crypt is writing at this moment.
@@ -1330,37 +1552,36 @@ fn is_staging_file(candidate: &Path, staging: &Path) -> bool {
 /// nothing) and every symlink met while walking is skipped. `staging` is the
 /// archive being written, which is skipped if the destination sits inside the
 /// tree being packed.
-fn build_tar<W: Write>(paths: &[PathBuf], writer: W, staging: Option<&Path>) -> Result<TarStats> {
+fn build_tar<W: Write>(
+    paths: &[PathBuf],
+    writer: W,
+    staging: Option<&Path>,
+    reporter: &dyn Reporter,
+) -> Result<TarStats> {
     let mut builder = tar::Builder::new(writer);
     let mut stats = TarStats::default();
     let mut used: Vec<OsString> = Vec::new();
 
     for path in paths {
-        let meta = fs::symlink_metadata(path)
-            .map_err(|e| Error::other(format!("cannot stat '{}': {e}", path.display())))?;
+        let meta =
+            fs::symlink_metadata(path).map_err(|e| Error::io(err::cannot_stat(path, &e), &e))?;
         if meta.file_type().is_symlink() {
-            return Err(Error::invalid_input(format!(
-                "'{}' is a symlink; crypt does not archive symlinks. Pass the real path instead.",
-                path.display()
-            )));
+            return Err(Error::invalid_input(err::input_is_symlink(path)));
         }
         let root = PathBuf::from(dedupe_archive_name(&mut used, &archive_name_for(path)?));
 
         if meta.is_dir() {
-            add_tree_to_tar(&mut builder, &root, path, staging, &mut stats)?;
+            add_tree_to_tar(&mut builder, &root, path, staging, &mut stats, reporter)?;
         } else if meta.is_file() {
-            add_file_to_tar(&mut builder, &root, path, &mut stats)?;
+            add_file_to_tar(&mut builder, &root, path, &mut stats, reporter)?;
         } else {
-            return Err(Error::invalid_input(format!(
-                "'{}' is neither a regular file nor a directory",
-                path.display()
-            )));
+            return Err(Error::invalid_input(err::not_a_file_or_directory(path)));
         }
     }
 
     builder
         .into_inner()
-        .map_err(|e| Error::other(format!("failed to finish the tar stream: {e}")))?;
+        .map_err(|e| Error::io(err::tar_finish_failed(&e), &e))?;
     Ok(stats)
 }
 
@@ -1371,6 +1592,13 @@ fn build_tar<W: Write>(paths: &[PathBuf], writer: W, staging: Option<&Path>) -> 
 #[derive(Default, Debug)]
 struct ExtractStats {
     pub skipped: u64,
+    /// Entries whose name `--compat` changed: illegal characters replaced, or a
+    /// `_1` suffix because the mapped name was already taken.
+    pub renamed: u64,
+    /// Entries restored byte for byte whose name holds a character exFAT or
+    /// Win32 refuses. Non-zero means the restore will not survive a trip through
+    /// such a filesystem, which is worth saying out loud.
+    pub not_exfat_safe: u64,
 }
 
 struct ExtractResult {
@@ -1379,17 +1607,22 @@ struct ExtractResult {
     pub stats: ExtractStats,
 }
 
-/// Split a stored tar path into sanitized components, or reject it.
+/// Split a stored tar path into its components, or reject it.
 ///
 /// Uses `Path::components` so `..` is caught structurally, and works on raw
-/// bytes so non-UTF-8 names survive the round trip.
-fn sanitized_components(path: &Path) -> Option<Vec<OsString>> {
+/// bytes so non-UTF-8 names survive the round trip. The components come back
+/// exactly as stored: mapping them is a per-entry decision, and the stored form
+/// is what the rename map is keyed by, so `a:b` and `a_b` stay two different
+/// entries even when `--compat` would give them the same name.
+fn tar_path_components(path: &Path) -> Option<Vec<OsString>> {
     let mut components = Vec::new();
     for component in path.components() {
         match component {
             Component::Normal(os) => {
-                let bytes = sanitize_name_bytes(os.as_bytes())?;
-                components.push(OsString::from_vec(bytes));
+                if !component_is_usable(os.as_bytes()) {
+                    return None;
+                }
+                components.push(os.to_os_string());
             }
             Component::CurDir => {}
             _ => return None,
@@ -1402,17 +1635,35 @@ fn sanitized_components(path: &Path) -> Option<Vec<OsString>> {
     }
 }
 
-/// Extract a tar archive into `base_path`, sanitizing every path to be
-/// exFAT-safe and giving any colliding top-level name a `_n` suffix.
+/// Extract a tar archive into `base_path`.
+///
+/// Names are restored byte for byte unless `compat` is set, where characters
+/// exFAT/Win32 refuses become '_' and a name whose destination is already taken
+/// gets a `_1`, `_2`, ... suffix — at every depth, not just the top level, so
+/// `a:b` next to `a_b` keeps both files.
+///
+/// With `partial` set (a `.coffin`), the entry that the cut interrupted is
+/// dropped and named, everything that was written completely is kept, and the
+/// walk stops at the first bad entry: the rest of the stream is unusable.
 ///
 /// Only regular files and directories are extracted: a symlink or hard-link
 /// entry is skipped rather than created, which is what would otherwise let a
 /// crafted archive write outside `base_path` through a link.
-fn unpack_tar_sanitized<R: Read>(
+fn unpack_tar_tree<R: Read>(
     archive: &mut tar::Archive<R>,
     base_path: &Path,
+    compat: bool,
+    partial: bool,
+    reporter: &dyn Reporter,
+    renamed: &mut Vec<PathBuf>,
 ) -> Result<ExtractResult> {
-    let mut resolved: HashMap<OsString, OsString> = HashMap::new();
+    // Stored component path -> directory it was extracted into. Keyed by the
+    // stored name so the entries under one stored directory all land in the same
+    // place, even after a rename (a foreign archive need not list a parent
+    // before its children).
+    let mut dir_map: HashMap<PathBuf, PathBuf> = HashMap::new();
+    // Names already handed out in each destination directory.
+    let mut used: HashMap<PathBuf, HashSet<OsString>> = HashMap::new();
     let mut tops: Vec<OsString> = Vec::new();
     let mut stats = ExtractStats::default();
     // Directory modes are applied last: chmod-ing a directory to something
@@ -1421,12 +1672,18 @@ fn unpack_tar_sanitized<R: Read>(
 
     let entries = archive
         .entries()
-        .map_err(|e| Error::other(format!("cannot read the tar stream: {e}")))?;
+        .map_err(|e| Error::io(err::cannot_read_tar(&e), &e))?;
     for entry_result in entries {
         let mut entry = match entry_result {
             Ok(entry) => entry,
+            // A partial archive ends in the middle of something; whatever came
+            // after it is not readable either.
+            Err(e) if partial => {
+                reporter.warning(&warn::partial_header_cut(&e));
+                break;
+            }
             Err(e) => {
-                eprintln!("[WARN] Skipping unreadable tar entry: {e}");
+                reporter.warning(&warn::skipping_unreadable_entry(&e));
                 stats.skipped += 1;
                 continue;
             }
@@ -1435,62 +1692,111 @@ fn unpack_tar_sanitized<R: Read>(
         let raw_path = match entry.path() {
             Ok(path) => path.into_owned(),
             Err(e) => {
-                eprintln!("[WARN] Skipping tar entry with an unreadable path: {e}");
+                reporter.warning(&warn::skipping_unreadable_entry_path(&e));
                 stats.skipped += 1;
                 continue;
             }
         };
 
-        let mut components = match sanitized_components(&raw_path) {
-            Some(components) => components,
+        let stored = match tar_path_components(&raw_path) {
+            Some(stored) => stored,
             None => {
-                eprintln!(
-                    "[WARN] Skipping unsafe tar entry '{}' (path traversal or unusable name).",
-                    raw_path.display()
-                );
+                reporter.warning(&warn::skipping_unsafe_entry(&raw_path));
                 stats.skipped += 1;
                 continue;
             }
         };
 
-        let top = components[0].clone();
-        let mapped = match resolved.get(&top) {
-            Some(name) => name.clone(),
-            None => {
-                let name = unique_component(base_path, &top);
-                resolved.insert(top, name.clone());
-                tops.push(name.clone());
-                name
-            }
-        };
-        components[0] = mapped;
-
+        // Map every stored component to its destination, in order. A component
+        // already mapped keeps its destination, so all the entries under one
+        // stored directory agree on where that directory is.
         let mut full_path = base_path.to_path_buf();
-        for component in &components {
-            full_path.push(component);
+        let mut stored_prefix = PathBuf::new();
+        for (depth, raw) in stored.iter().enumerate() {
+            stored_prefix.push(raw);
+            if let Some(mapped) = dir_map.get(&stored_prefix) {
+                full_path = mapped.clone();
+                continue;
+            }
+
+            let mut name = OsString::from_vec(sanitize_component_bytes(raw.as_bytes(), compat));
+            if compat {
+                let (mapped, _was_taken) =
+                    unique_extracted_name(&mut used, &full_path, name, &raw_path, reporter);
+                // An entry counts as renamed when its destination differs from
+                // the stored component: sanitized characters or a `_1` suffix.
+                if mapped != *raw {
+                    stats.renamed += 1;
+                }
+                name = mapped;
+            } else if would_rename_for_compat(raw.as_bytes()) {
+                // Restored exactly, but it will not fit on exFAT/Win32.
+                stats.not_exfat_safe += 1;
+            }
+
+            if depth == 0 {
+                tops.push(name.clone());
+            }
+            full_path.push(&name);
+            dir_map.insert(stored_prefix.clone(), full_path.clone());
         }
+
+        // Remember every entry whose destination differs from the name it was
+        // stored under, so the outcome can say so without the caller parsing
+        // warnings. Only `compat` can move a name.
+        if compat {
+            let relative = full_path
+                .strip_prefix(base_path)
+                .unwrap_or(&full_path)
+                .to_path_buf();
+            if relative != raw_path && !renamed.contains(&relative) {
+                renamed.push(relative);
+            }
+        }
+
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|e| Error::other(format!("cannot create '{}': {e}", parent.display())))?;
+                .map_err(|e| Error::io(err::cannot_create(parent, &e), &e))?;
         }
 
         let entry_type = entry.header().entry_type();
         if entry_type.is_dir() {
-            fs::create_dir_all(&full_path).map_err(|e| {
-                Error::other(format!("cannot create '{}': {e}", full_path.display()))
-            })?;
+            fs::create_dir_all(&full_path)
+                .map_err(|e| Error::io(err::cannot_create(&full_path, &e), &e))?;
             let mode = entry.header().mode().unwrap_or(0o755) & 0o777;
             let mtime = entry.header().mtime().unwrap_or(0);
             deferred_dirs.push((full_path, mode, mtime));
         } else if entry_type.is_file() {
-            entry.unpack(&full_path).map_err(|e| {
-                Error::other(format!("cannot extract '{}': {e}", full_path.display()))
-            })?;
+            let declared = entry.header().size().unwrap_or(0);
+            match entry.unpack(&full_path) {
+                Ok(_) => {
+                    // A tar reader fed by a pipe can hand back a short file
+                    // without an error, so a partial archive checks what landed
+                    // against what the header promised.
+                    if partial {
+                        let written = fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
+                        if written != declared {
+                            let _ = fs::remove_file(&full_path);
+                            reporter
+                                .warning(&warn::partial_entry_cut(&raw_path, written, declared));
+                            break;
+                        }
+                    }
+                }
+                Err(_) if partial => {
+                    // The entry the cut interrupted: it is not a file that
+                    // finished, so it must not be kept.
+                    let written = fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
+                    let _ = fs::remove_file(&full_path);
+                    reporter.warning(&warn::partial_entry_cut(&raw_path, written, declared));
+                    break;
+                }
+                Err(e) => {
+                    return Err(Error::io(err::cannot_extract(&full_path, &e), &e));
+                }
+            }
         } else {
-            eprintln!(
-                "[WARN] Skipping tar entry '{}': only regular files and directories are extracted.",
-                raw_path.display()
-            );
+            reporter.warning(&warn::skipping_special_entry(&raw_path));
             stats.skipped += 1;
         }
     }
@@ -1503,44 +1809,73 @@ fn unpack_tar_sanitized<R: Read>(
             filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(mtime as i64, 0));
     }
 
+    if stats.renamed > 0 {
+        reporter.warning(&warn::compat_renamed(stats.renamed));
+    }
+    if stats.not_exfat_safe > 0 {
+        reporter.warning(&warn::names_not_exfat_safe(stats.not_exfat_safe));
+    }
+
     Ok(ExtractResult { tops, stats })
 }
 
-/// Extract the single regular file an archive holds into `dest`.
+/// Extract the single regular file an archive holds into `dest`, and report
+/// whether a whole file was written.
 ///
 /// `create_new` closes the window between choosing a free name and writing it.
-fn unpack_single_file<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> Result<()> {
+///
+/// In `partial` mode a cut archive usually leaves a short file behind without an
+/// error (`io::copy` simply stops at the end of the stream), so what landed is
+/// compared with the size the header declared and a mismatch is dropped. The
+/// caller then has nothing to keep, which is the honest answer for a `.coffin`
+/// whose only file was cut in half.
+fn unpack_single_file<R: Read>(
+    archive: &mut tar::Archive<R>,
+    dest: &Path,
+    partial: bool,
+    reporter: &dyn Reporter,
+) -> Result<bool> {
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| Error::other(format!("cannot create '{}': {e}", parent.display())))?;
+        fs::create_dir_all(parent).map_err(|e| Error::io(err::cannot_create(parent, &e), &e))?;
     }
     let mut entries = archive
         .entries()
-        .map_err(|e| Error::other(format!("cannot read the tar stream: {e}")))?;
+        .map_err(|e| Error::io(err::cannot_read_tar(&e), &e))?;
 
     let mut entry = match entries.next() {
         Some(Ok(entry)) => entry,
-        Some(Err(e)) => return Err(Error::other(format!("cannot read the tar stream: {e}"))),
-        None => return Err(Error::malformed("the archive contains no entries")),
+        Some(Err(e)) => return Err(Error::io(err::cannot_read_tar(&e), &e)),
+        None => return Err(Error::malformed(err::NO_ENTRIES)),
     };
 
     if !entry.header().entry_type().is_file() {
-        return Err(Error::malformed(
-            "the archive's first entry is not a regular file",
-        ));
+        return Err(Error::malformed(err::FIRST_ENTRY_NOT_A_FILE));
     }
+    let declared = entry.header().size().unwrap_or(0);
 
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(dest)
-        .map_err(|e| Error::other(format!("cannot create '{}': {e}", dest.display())))?;
-    io::copy(&mut entry, &mut output)
-        .map_err(|e| Error::other(format!("cannot write '{}': {e}", dest.display())))?;
+        .map_err(|e| Error::io(err::cannot_create(dest, &e), &e))?;
+    let copied = io::copy(&mut entry, &mut output);
+
+    if partial {
+        let written = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+        if copied.is_err() || written != declared {
+            drop(output);
+            let _ = fs::remove_file(dest);
+            reporter.warning(&warn::partial_entry_cut(dest, written, declared));
+            return Ok(false);
+        }
+    } else {
+        copied.map_err(|e| Error::io(err::cannot_write(dest, &e), &e))?;
+    }
+
     output
         .sync_all()
-        .map_err(|e| Error::other(format!("cannot flush '{}': {e}", dest.display())))?;
-    Ok(())
+        .map_err(|e| Error::io(err::cannot_flush(dest, &e), &e))?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1559,8 +1894,7 @@ impl StagingDir {
     /// Create a fresh staging directory inside `parent` (same filesystem, so the
     /// final rename is atomic).
     pub fn new(parent: &Path) -> Result<StagingDir> {
-        fs::create_dir_all(parent)
-            .map_err(|e| Error::other(format!("cannot create '{}': {e}", parent.display())))?;
+        fs::create_dir_all(parent).map_err(|e| Error::io(err::cannot_create(parent, &e), &e))?;
         for _ in 0..16 {
             let mut suffix = [0u8; 8];
             OsRng.fill_bytes(&mut suffix);
@@ -1571,18 +1905,10 @@ impl StagingDir {
                     return Ok(StagingDir { path });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => {
-                    return Err(Error::other(format!(
-                        "cannot create '{}': {e}",
-                        path.display()
-                    )));
-                }
+                Err(e) => return Err(Error::io(err::cannot_create(&path, &e), &e)),
             }
         }
-        Err(Error::other(format!(
-            "cannot create a staging directory in '{}': too many name collisions",
-            parent.display()
-        )))
+        Err(Error::other(err::no_staging_name(parent)))
     }
 
     pub fn path(&self) -> &Path {
@@ -1601,11 +1927,9 @@ impl Drop for StagingDir {
 /// cut mid-entry and the tar stream cannot be finished.
 fn staged_tops(dir: &Path) -> Result<Vec<OsString>> {
     let mut names = Vec::new();
-    let entries = fs::read_dir(dir)
-        .map_err(|e| Error::other(format!("cannot read '{}': {e}", dir.display())))?;
+    let entries = fs::read_dir(dir).map_err(|e| Error::io(err::cannot_read_dir(dir, &e), &e))?;
     for entry in entries {
-        let entry =
-            entry.map_err(|e| Error::other(format!("cannot read '{}': {e}", dir.display())))?;
+        let entry = entry.map_err(|e| Error::io(err::cannot_read_dir(dir, &e), &e))?;
         names.push(entry.file_name());
     }
     names.sort();
@@ -1624,34 +1948,82 @@ fn hex(bytes: &[u8]) -> String {
 // Passwords
 // ---------------------------------------------------------------------------
 
+/// The form of a password that the KDF actually hashes: NFC.
+///
+/// Canonical composition only, so `e` followed by a combining acute and the
+/// single composed `é` are the same password — which Unicode says they are, even
+/// though a keyboard or a filename may hand over either. NFC is the identity for
+/// ASCII and for text that is already composed, so an archive written by an older
+/// build still derives exactly the same key.
+///
+/// Deliberately **not** NFKC: compatibility folding would merge characters
+/// Unicode defines as *different* (a fullwidth `ｅ` with `e`, `ﬁ` with `fi`),
+/// which shrinks the password space without making anything more reliable. NFC
+/// fixes the one thing that really does go wrong — composed versus decomposed
+/// text from different sources.
+fn normalized_password(password: &str) -> Zeroizing<String> {
+    Zeroizing::new(password.nfc().collect())
+}
+
+/// True for the Unicode `Cf` (format) code points, and for U+180E: zero-width
+/// spaces and joiners, directionality marks and overrides, the BOM, soft hyphen,
+/// the tag characters. U+180E is a space separator in today's Unicode tables but
+/// has never had a visible form.
+///
+/// None of them can be checked by eye while typing, so a password carrying one is
+/// a password that will not be retyped correctly by hand.
+fn is_invisible_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x08E2
+            | 0x180E
+            | 0xFEFF
+            | 0x110BD
+            | 0x110CD
+            | 0xE0001
+            | 0x0600..=0x0605
+            | 0x0890..=0x0891
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFFF9..=0xFFFB
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0020..=0xE007F
+    )
+}
+
 /// Rules enforced **before encrypting** only. Decrypting must accept whatever a
 /// legacy archive was created with, including short or empty passwords.
+///
+/// Any script is allowed. What is refused is what a person cannot see or retype:
+/// control characters, invisible format characters, and whitespace other than a
+/// plain space. Every rule is applied to the NFC form, because that is the form
+/// which is hashed: "at least 8 characters" has to mean 8 characters of the text
+/// that ends up in the key.
 fn validate_password_for_encrypt(password: &str) -> Result<()> {
-    if password.is_empty() {
-        return Err(Error::invalid_input("the password must not be empty"));
+    let normalized = normalized_password(password);
+    if normalized.is_empty() {
+        return Err(Error::invalid_input(err::PASSWORD_EMPTY));
     }
-    if let Some(c) = password.chars().find(|c| !c.is_ascii()) {
-        return Err(Error::invalid_input(format!(
-            "the password must be printable ASCII (found U+{:04X}); a password that normalizes \
-             differently on another machine is a security problem",
-            c as u32
-        )));
+    if let Some(c) = normalized.chars().find(|c| c.is_control()) {
+        return Err(Error::invalid_input(err::password_control_char(c)));
     }
-    if let Some(c) = password
-        .chars()
-        .find(|c| (*c as u32) < 0x20 || *c == '\x7f')
-    {
-        return Err(Error::invalid_input(format!(
-            "the password must not contain control characters (found 0x{:02x})",
-            c as u32
-        )));
+    if let Some(c) = normalized.chars().find(|c| is_invisible_char(*c)) {
+        return Err(Error::invalid_input(err::password_format_char(c)));
     }
-    let length = password.chars().count();
+    if let Some(c) = normalized.chars().find(|c| c.is_whitespace() && *c != ' ') {
+        return Err(Error::invalid_input(err::password_odd_space(c)));
+    }
+    let length = normalized.chars().count();
     if length < MIN_PASSWORD_LEN {
-        return Err(Error::invalid_input(format!(
-            "the password must be at least {MIN_PASSWORD_LEN} characters for encryption \
-             (got {length})"
-        )));
+        return Err(Error::invalid_input(err::password_too_short(length)));
     }
     Ok(())
 }
@@ -1662,14 +2034,6 @@ fn clear_masked_input(len: usize) {
         print!("\x08 \x08");
     }
     let _ = io::stdout().flush();
-}
-
-/// Index and value of the first non-ASCII byte, if there is one.
-fn first_non_ascii(bytes: &[u8]) -> Option<(usize, u8)> {
-    bytes
-        .iter()
-        .position(|b| !b.is_ascii())
-        .map(|i| (i, bytes[i]))
 }
 
 /// Restores terminal settings when dropped.
@@ -1704,7 +2068,7 @@ fn read_piped_password() -> Result<Zeroizing<String>> {
     loop {
         let read = stdin
             .read(&mut byte)
-            .map_err(|e| Error::other(format!("cannot read the password from stdin: {e}")))?;
+            .map_err(|e| Error::io(err::cannot_read_password_stdin(&e), &e))?;
         // End of input, or the end of the line. Either way the password is what
         // came before, not an error: an empty line is a legitimate (if unwise)
         // legacy password, and the caller decides whether to refuse it.
@@ -1712,9 +2076,7 @@ fn read_piped_password() -> Result<Zeroizing<String>> {
             break;
         }
         if line.len() >= MAX_PIPED_PASSWORD_BYTES {
-            return Err(Error::invalid_input(format!(
-                "the password on stdin is longer than {MAX_PIPED_PASSWORD_BYTES} bytes"
-            )));
+            return Err(Error::invalid_input(err::piped_password_too_long()));
         }
         line.push(byte[0]);
     }
@@ -1725,21 +2087,23 @@ fn read_piped_password() -> Result<Zeroizing<String>> {
     }
 
     let text = std::str::from_utf8(&line)
-        .map_err(|_| Error::invalid_input("the password on stdin is not valid UTF-8"))?;
+        .map_err(|_| Error::invalid_input(err::PIPED_PASSWORD_NOT_UTF8))?;
     Ok(Zeroizing::new(text.to_owned()))
 }
 
 /// Read a password from the terminal with masked echo.
 ///
-/// Keeps asking until the entry is printable ASCII: a non-ASCII character is
-/// reported and the whole attempt is discarded, so nothing is silently dropped
-/// and a multi-byte character produces one message rather than one per byte.
+/// The entry is read as UTF-8 bytes, so any script works, and it is masked and
+/// edited per character rather than per byte: one `*` per keypress, and backspace
+/// removes a whole multi-byte character. An entry that is not valid UTF-8 is
+/// reported and asked for again rather than dropped, so a paste from a terminal
+/// in some other encoding cannot silently become a different password.
 fn prompt_masked(prompt: &str) -> Result<Zeroizing<String>> {
     println!("{prompt}");
 
     let stdin_fd = io::stdin().as_raw_fd();
-    let original = Termios::from_fd(stdin_fd)
-        .map_err(|e| Error::other(format!("cannot read terminal attributes: {e}")))?;
+    let original =
+        Termios::from_fd(stdin_fd).map_err(|e| Error::io(err::cannot_read_terminal(&e), &e))?;
     let mut raw = original;
     // ISIG is cleared too: leaving it on would make the tty raise SIGINT on
     // Ctrl-C, which kills the process without unwinding, so the guard below
@@ -1749,7 +2113,7 @@ fn prompt_masked(prompt: &str) -> Result<Zeroizing<String>> {
     raw.c_cc[termios::VMIN] = 1;
     raw.c_cc[termios::VTIME] = 0;
     termios::tcsetattr(stdin_fd, TCSANOW, &raw)
-        .map_err(|e| Error::other(format!("cannot switch the terminal to raw mode: {e}")))?;
+        .map_err(|e| Error::io(err::cannot_set_raw_mode(&e), &e))?;
     let _guard = TermiosGuard {
         fd: stdin_fd,
         original,
@@ -1757,9 +2121,11 @@ fn prompt_masked(prompt: &str) -> Result<Zeroizing<String>> {
 
     let mut stdin = io::stdin();
     'attempt: loop {
-        // Zeroizing: an attempt that is thrown away for being non-ASCII, or that
-        // never becomes a password, still leaves nothing in freed memory.
+        // Zeroizing: an attempt that is thrown away, or that never becomes a
+        // password, still leaves nothing in freed memory.
         let mut typed: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+        // Stars on screen, which is one per character rather than one per byte.
+        let mut masked = 0usize;
 
         loop {
             let mut byte = [0u8; 1];
@@ -1770,9 +2136,7 @@ fn prompt_masked(prompt: &str) -> Result<Zeroizing<String>> {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    return Err(Error::other(format!(
-                        "cannot read the password from the terminal: {e}"
-                    )));
+                    return Err(Error::io(err::cannot_read_password_terminal(&e), &e));
                 }
             }
             match byte[0] {
@@ -1781,46 +2145,63 @@ fn prompt_masked(prompt: &str) -> Result<Zeroizing<String>> {
                     break;
                 }
                 0x7f | 0x08 => {
-                    if typed.pop().is_some() {
+                    if pop_char(&mut typed) {
+                        masked = masked.saturating_sub(1);
                         print!("\x08 \x08");
                         let _ = io::stdout().flush();
                     }
                 }
                 0x15 => {
-                    clear_masked_input(typed.len());
+                    clear_masked_input(masked);
                     typed.clear();
+                    masked = 0;
                 }
                 // Ctrl-C / Ctrl-D: abort. Returning drops the guard, which
                 // restores the terminal (unlike `process::exit`).
                 0x03 | 0x04 => {
                     println!();
-                    return Err(Error::other("password entry aborted"));
+                    return Err(Error::other(err::PASSWORD_ABORTED));
                 }
-                // Printable ASCII and non-ASCII, so the check below can report
-                // which byte was wrong. Other control bytes are ignored.
+                // Printable ASCII, plus the lead and continuation bytes of
+                // anything else the terminal sends as UTF-8. Other control bytes
+                // are ignored, and the whole entry is validated after Enter.
                 byte if byte >= 0x20 => {
                     typed.push(byte);
-                    print!("*");
-                    let _ = io::stdout().flush();
+                    // One star per character: 0b10xx_xxxx continues the previous
+                    // one rather than starting a new keypress.
+                    if byte & 0xC0 != 0x80 {
+                        masked += 1;
+                        print!("*");
+                        let _ = io::stdout().flush();
+                    }
                 }
                 _ => {}
             }
         }
 
-        if let Some((index, byte)) = first_non_ascii(&typed) {
-            eprintln!("[WARN] The password has a non-ASCII byte 0x{byte:02X} at position {index}.");
-            eprintln!("[WARN] Passwords must be printable ASCII. Type a new password.");
-            continue 'attempt;
-        }
-
         // Borrowed rather than consumed, so the bytes above are zeroized either
-        // way. The bytes accepted by the read loop are all ASCII, so this error
-        // is unreachable today; it stays as the belt to that pair of braces.
+        // way. A terminal that is not sending UTF-8, or a paste of a broken
+        // sequence, can still land here, so the entry is asked for again rather
+        // than turned into a different password.
         return match std::str::from_utf8(&typed) {
             Ok(password) => Ok(Zeroizing::new(password.to_owned())),
-            Err(_) => Err(Error::other("password entry contained invalid bytes")),
+            Err(_) => {
+                eprintln!("{}", warn::PASSWORD_NOT_UTF8);
+                continue 'attempt;
+            }
         };
     }
+}
+
+/// Remove one character (one to four bytes) from the masked input.
+fn pop_char(typed: &mut Vec<u8>) -> bool {
+    if typed.pop().is_none() {
+        return false;
+    }
+    while typed.last().is_some_and(|byte| byte & 0xC0 == 0x80) {
+        typed.pop();
+    }
+    true
 }
 
 /// Where an encryption password comes from.
@@ -1839,23 +2220,20 @@ fn read_password(confirm: bool, source: PasswordSource) -> Result<Zeroizing<Stri
     }
 
     if !io::stdin().is_terminal() {
-        return Err(Error::other(
-            "no terminal is available to ask for a password. Use --password-stdin to read it from \
-             a pipe instead",
-        ));
+        return Err(Error::other(err::NO_TERMINAL));
     }
 
     if confirm {
         loop {
-            let first = prompt_masked("Enter password:")?;
-            let second = prompt_masked("Confirm password:")?;
+            let first = prompt_masked(info::ENTER_PASSWORD)?;
+            let second = prompt_masked(info::CONFIRM_PASSWORD)?;
             if *first == *second {
                 return Ok(first);
             }
-            eprintln!("Passwords did not match, try again.");
+            eprintln!("{}", info::PASSWORDS_DID_NOT_MATCH);
         }
     } else {
-        prompt_masked("Enter password:")
+        prompt_masked(info::ENTER_PASSWORD)
     }
 }
 
@@ -1893,24 +2271,70 @@ fn progress_enabled() -> bool {
     io::stdout().is_terminal()
 }
 
+/// The reporter the CLI installs: notices on stdout, warnings on stderr and a
+/// progress bar on stdout when stdout is a terminal.
+///
+/// This is what keeps the binary's output exactly as it always was while the
+/// library entry points stay silent unless a caller asks otherwise.
+struct ConsoleReporter;
+
+impl Reporter for ConsoleReporter {
+    fn info(&self, line: &str) {
+        println!("{line}");
+    }
+
+    fn warning(&self, line: &str) {
+        eprintln!("{line}");
+    }
+
+    fn wants_progress(&self) -> bool {
+        progress_enabled()
+    }
+
+    fn progress(&self, done: u64, total: u64) {
+        print_progress_bar(done, total, false, true);
+    }
+
+    fn finished(&self, _done: u64, total: u64) {
+        print_progress_bar(total, total, true, true);
+    }
+}
+
 /// Spawn the thread that redraws the progress bar until `done` is set.
+///
+/// Returns `None` when the reporter does not want progress at all, so a silent
+/// or warning-only caller never pays for the thread. The thread parks between
+/// updates and [`finish_progress`] unparks it, so finishing does not wait for the
+/// next tick.
 fn spawn_progress_thread(
     progress: Arc<AtomicU64>,
     done: Arc<AtomicBool>,
     total: u64,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let enabled = progress_enabled();
+    reporter: Arc<dyn Reporter>,
+) -> Option<thread::JoinHandle<()>> {
+    if !reporter.wants_progress() {
+        return None;
+    }
+    Some(thread::spawn(move || {
         while !done.load(Ordering::Relaxed) {
-            thread::sleep(std::time::Duration::from_millis(400));
-            if enabled && total > 0 {
-                print_progress_bar(progress.load(Ordering::Relaxed), total, false, enabled);
+            thread::park_timeout(std::time::Duration::from_millis(400));
+            if done.load(Ordering::Relaxed) {
+                break;
             }
+            reporter.progress(progress.load(Ordering::Relaxed), total);
         }
-        if enabled && total > 0 {
-            print_progress_bar(total, total, true, enabled);
-        }
-    })
+        reporter.finished(total, total);
+    }))
+}
+
+/// Stop the progress thread and wait for its final update, without the delay a
+/// plain sleep-until-done loop would add to every operation.
+fn finish_progress(done: &AtomicBool, handle: Option<thread::JoinHandle<()>>) {
+    done.store(true, Ordering::Relaxed);
+    if let Some(handle) = handle {
+        handle.thread().unpark();
+        let _ = handle.join();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1929,8 +2353,70 @@ struct CompressedChunk {
     compressed: Zeroizing<Vec<u8>>,
 }
 
+/// What [`encrypt_file`] produced.
+///
+/// The archive path is always there; the counters say whether the archive is
+/// everything that was asked for. [`EncryptOutcome::is_complete`] is the short
+/// answer to that.
+///
+/// An archive that lost some data is still **published**, because it is a valid
+/// archive of everything that could be read; the counts are how a caller finds
+/// out. Every field is a count, not a list of paths, so a caller that needs the
+/// names should install a [`Reporter`] as well.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptOutcome {
+    /// The `.crypt` file that was created.
+    pub archive: PathBuf,
+    /// Regular files written into the archive.
+    pub files: u64,
+    /// Bytes read from the inputs. This is the size of the data that went in,
+    /// not the size of the archive on disk (which is compressed and encrypted).
+    pub bytes: u64,
+    /// Symlinks that were skipped. crypt never archives them, so this is not data
+    /// loss unless the caller expected it to be followed.
+    pub symlinks_skipped: u64,
+    /// Special files (FIFOs, sockets, devices) that were skipped. Never archived.
+    pub special_files_skipped: u64,
+    /// Times the half-written archive was found inside the tree being packed and
+    /// left out, so the archive does not contain itself.
+    pub staging_files_skipped: u64,
+    /// Files that could not be opened or read. **Their data is missing.**
+    pub unreadable: u64,
+    /// Directories left out because they are a mount point onto another
+    /// filesystem. **Their data is missing.**
+    pub other_filesystems: u64,
+}
+
+impl EncryptOutcome {
+    /// True when everything crypt was given made it into the archive.
+    ///
+    /// Skipped symlinks and special files do not count against this: they are
+    /// never archived. Unreadable files and mount points do.
+    pub fn is_complete(&self) -> bool {
+        self.unreadable == 0 && self.other_filesystems == 0
+    }
+}
+
 /// Knobs for [`encrypt_file`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Build one from [`EncryptOptions::default`] and the `with_` methods:
+///
+/// ```
+/// use crypt::EncryptOptions;
+///
+/// let options = EncryptOptions::default().with_workers(8).with_level(19);
+/// assert_eq!(options.workers, 8);
+/// ```
+///
+/// The defaults are four workers, Zstd level 22 and no reporter. Level 22 is the
+/// slowest and most memory-hungry setting (the README's measurements are 300 MB
+/// at level 19 and 700 MB at level 22 with four workers, plus roughly 130 MB per
+/// extra worker at 22); lower it when memory or speed matters more than the last
+/// few percent of compression.
+///
+/// The reporter is not part of equality: two options that describe the same work
+/// are equal even if they watch it through different reporters.
+#[derive(Clone)]
 pub struct EncryptOptions {
     /// Worker threads used to compress chunks. Zero is treated as one, and
     /// anything over 128 is capped at 128, so a caller cannot ask for a thread
@@ -1943,6 +2429,39 @@ pub struct EncryptOptions {
     /// Zstd compression level. Values outside `1..=22` are clamped, so a caller
     /// cannot ask for a level the build does not support.
     pub level: i32,
+    /// Where warnings and progress go. `None` — the default — is completely
+    /// silent; the outcome still carries the facts.
+    pub reporter: Option<Arc<dyn Reporter>>,
+}
+
+impl EncryptOptions {
+    /// The defaults, spelled out: four workers, Zstd level 22, silent.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the worker count. Out-of-range values are clamped when the archive is
+    /// written, not here.
+    #[must_use]
+    pub fn with_workers(mut self, workers: usize) -> Self {
+        self.workers = workers;
+        self
+    }
+
+    /// Set the Zstd compression level. Out-of-range values are clamped when the
+    /// archive is written, not here.
+    #[must_use]
+    pub fn with_level(mut self, level: i32) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Send warnings, skip notices and progress to `reporter`.
+    #[must_use]
+    pub fn with_reporter(mut self, reporter: Arc<dyn Reporter>) -> Self {
+        self.reporter = Some(reporter);
+        self
+    }
 }
 
 impl Default for EncryptOptions {
@@ -1950,9 +2469,28 @@ impl Default for EncryptOptions {
         EncryptOptions {
             workers: DEFAULT_NUM_WORKERS,
             level: DEFAULT_ZSTD_COMPRESSION_LEVEL,
+            reporter: None,
         }
     }
 }
+
+impl fmt::Debug for EncryptOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptOptions")
+            .field("workers", &self.workers)
+            .field("level", &self.level)
+            .field("reporter", &self.reporter.as_ref().map(|_| "<installed>"))
+            .finish()
+    }
+}
+
+impl PartialEq for EncryptOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.workers == other.workers && self.level == other.level
+    }
+}
+
+impl Eq for EncryptOptions {}
 
 fn random_salt() -> Zeroizing<[u8; SALT_SIZE]> {
     let mut salt = [0u8; SALT_SIZE];
@@ -2026,18 +2564,10 @@ fn create_coffin(base_dir: &Path, stem: &OsStr) -> Result<(PathBuf, BufWriter<Fi
                 return Ok((coffin_path, BufWriter::with_capacity(8 * 1024 * 1024, file)));
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(Error::other(format!(
-                    "cannot create '{}': {e}",
-                    coffin_path.display()
-                )));
-            }
+            Err(e) => return Err(Error::io(err::cannot_create(&coffin_path, &e), &e)),
         }
     }
-    Err(Error::other(format!(
-        "cannot find a free output name in '{}'",
-        base_dir.display()
-    )))
+    Err(Error::other(err::no_free_output_name(base_dir)))
 }
 
 /// Encrypt every chunk from `rx` in index order.
@@ -2061,19 +2591,12 @@ fn write_all_chunks<W: Write>(
             next_index += 1;
         }
         if pending.len() > max_pending {
-            return Err(Error::other(format!(
-                "{} chunks arrived out of order and could not be written; the stream would contain \
-                 a gap",
-                pending.len()
-            )));
+            return Err(Error::other(err::chunks_out_of_order(pending.len())));
         }
     }
 
     if let Some(lowest) = pending.keys().min().copied() {
-        return Err(Error::other(format!(
-            "chunk {lowest} (and {} after it) could not be written; the stream would contain a gap",
-            pending.len()
-        )));
+        return Err(Error::other(err::chunk_gap(lowest, pending.len())));
     }
 
     Ok(next_index)
@@ -2085,16 +2608,14 @@ fn abandon_partial(
     output_file: &mut BufWriter<File>,
     coffin_path: &Path,
     message: Error,
-) -> Result<PathBuf> {
+    reporter: &dyn Reporter,
+) -> Error {
     let _ = output_file.flush();
     let _ = output_file.get_ref().sync_all();
     if coffin_path.exists() {
-        eprintln!(
-            "[WARN] A partial archive was left at '{}'. Decrypt it to recover what was written.",
-            coffin_path.display()
-        );
+        reporter.warning(&warn::partial_archive_left(coffin_path));
     }
-    Err(message)
+    message
 }
 
 /// Flush a directory entry to disk so a rename survives a power loss.
@@ -2104,31 +2625,77 @@ fn sync_dir(dir: &Path) {
     }
 }
 
-/// Encrypt `inputs` into a single `.crypt` archive and return its path.
+/// Encrypt `inputs` into a single `.crypt` archive and describe what was written.
 ///
 /// Writes to a `.coffin` staging file first and only publishes it once every
 /// thread has finished, the trailer is sealed and the data is on disk. The
 /// archive name comes from the first input (plus a random suffix), and the
 /// archive is never written over an existing file.
 ///
+/// `output_dir` is created (with `create_dir_all`) if it does not exist; when it
+/// is `None` the archive goes next to the first input. Several inputs become one
+/// archive named after the first of them.
+///
+/// Nothing is printed. Pass a [`Reporter`] in the options if a human should see
+/// the warnings and progress, and check [`EncryptOutcome::is_complete`] if the
+/// caller needs to know whether the archive holds everything it asked for.
+///
 /// # Errors
 ///
 /// [`Error::InvalidInput`] for an empty `inputs`, a path that cannot be archived
 /// (a symlink, a FIFO, a name with no file name), or an output that already
-/// exists. I/O and thread failures are [`Error::Other`].
+/// exists. Operating-system failures are [`Error::Io`] (with the
+/// [`std::io::ErrorKind`] preserved); a thread that died is [`Error::Other`].
 ///
-/// The password rules the CLI applies — printable ASCII, a minimum length — are
-/// *not* enforced here: a caller that has decided its own policy is not
-/// second-guessed.
-pub fn encrypt_file(
-    inputs: &[PathBuf],
+/// A file that cannot be read is *not* an error: it is counted in
+/// [`EncryptOutcome::unreadable`] and the rest of the archive is still published.
+///
+/// The password rules the CLI applies — any script except control and format
+/// characters, a minimum length — are *not* enforced here: a caller that has
+/// decided its own policy is not second-guessed. The password is still
+/// NFC-normalized before it reaches the KDF, exactly as the CLI does it.
+///
+/// # Examples
+///
+/// ```no_run
+/// use crypt::EncryptOptions;
+///
+/// let outcome = crypt::encrypt_file(
+///     &["/data", "/more"],
+///     "correcthorse",
+///     Some(std::path::Path::new("/backup")),
+///     &EncryptOptions::default().with_workers(8).with_level(19),
+/// )?;
+///
+/// if !outcome.is_complete() {
+///     eprintln!(
+///         "{} unreadable file(s) missing from {}",
+///         outcome.unreadable,
+///         outcome.archive.display()
+///     );
+/// }
+/// # Ok::<(), crypt::Error>(())
+/// ```
+pub fn encrypt_file<P: AsRef<Path>>(
+    inputs: &[P],
     password: &str,
     output_dir: Option<&Path>,
     opts: &EncryptOptions,
-) -> Result<PathBuf> {
+) -> Result<EncryptOutcome> {
+    let inputs: Vec<PathBuf> = inputs
+        .iter()
+        .map(|path| path.as_ref().to_path_buf())
+        .collect();
     if inputs.is_empty() {
-        return Err(Error::invalid_input("no input paths given"));
+        return Err(Error::invalid_input(err::NO_INPUT_PATHS));
     }
+    let reporter: Arc<dyn Reporter> = opts
+        .reporter
+        .clone()
+        .unwrap_or_else(|| Arc::new(SilentReporter));
+    // One form of the password for everything below, the KDF included. See
+    // `normalized_password` for why it is NFC and not NFKC.
+    let password = normalized_password(password);
     let first = &inputs[0];
     let archive_name = archive_name_for(first)?;
     let name_bytes = archive_name.as_bytes().to_vec();
@@ -2143,15 +2710,14 @@ pub fn encrypt_file(
             .unwrap_or(Path::new("."))
             .to_path_buf(),
     };
-    fs::create_dir_all(&base_dir)
-        .map_err(|e| Error::other(format!("cannot create '{}': {e}", base_dir.display())))?;
+    fs::create_dir_all(&base_dir).map_err(|e| Error::io(err::cannot_create(&base_dir, &e), &e))?;
 
     let workers = opts.workers.clamp(1, MAX_WORKERS);
     let salt = random_salt();
-    let keys = derive_keys(password, &salt)?;
+    let keys = derive_keys(&password, &salt)?;
 
     let mut total_input_size = 0u64;
-    for path in inputs {
+    for path in &inputs {
         total_input_size = total_input_size.saturating_add(tree_size(path)?);
     }
 
@@ -2179,22 +2745,33 @@ pub fn encrypt_file(
 
     // Pipeline: tar (I/O) -> pipe -> workers (compress) -> writer (encrypt+write).
     let (pipe_reader, pipe_writer) =
-        os_pipe::pipe().map_err(|e| Error::other(format!("cannot create a pipe: {e}")))?;
+        os_pipe::pipe().map_err(|e| Error::io(err::cannot_create_pipe(&e), &e))?;
 
     // Canonicalized so the walk recognises it through another spelling of the
     // same directory (`--output ./self` versus `self`).
     let staging_path = fs::canonicalize(&coffin_path).unwrap_or_else(|_| coffin_path.clone());
     let inputs_for_tar: Vec<PathBuf> = inputs.to_vec();
-    let tar_handle =
-        thread::spawn(move || build_tar(&inputs_for_tar, pipe_writer, Some(&staging_path)));
+    let tar_reporter = Arc::clone(&reporter);
+    let tar_handle = thread::spawn(move || {
+        build_tar(
+            &inputs_for_tar,
+            pipe_writer,
+            Some(&staging_path),
+            &*tar_reporter,
+        )
+    });
 
     let (raw_tx, raw_rx) = crossbeam_channel::bounded::<RawChunk>(workers);
     let (compressed_tx, compressed_rx) = crossbeam_channel::bounded::<CompressedChunk>(workers * 2);
 
     let progress = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
-    let progress_handle =
-        spawn_progress_thread(Arc::clone(&progress), Arc::clone(&done), total_input_size);
+    let progress_handle = spawn_progress_thread(
+        Arc::clone(&progress),
+        Arc::clone(&done),
+        total_input_size,
+        Arc::clone(&reporter),
+    );
 
     let pipe_reader_handle = thread::spawn(move || -> Result<u64> {
         let mut pipe_buf = BufReader::new(pipe_reader);
@@ -2207,9 +2784,7 @@ pub fn encrypt_file(
                 match pipe_buf.read(&mut chunk_data[offset..]) {
                     Ok(0) => break,
                     Ok(n) => offset += n,
-                    Err(e) => {
-                        return Err(Error::other(format!("reading the tar stream failed: {e}")))
-                    }
+                    Err(e) => return Err(Error::io(err::cannot_read_tar_stream(&e), &e)),
                 }
                 if offset >= CHUNK_SIZE {
                     break;
@@ -2250,7 +2825,7 @@ pub fn encrypt_file(
             // One reusable compression context per worker: a fresh context per
             // chunk peaked at several GB per worker at level 22.
             let mut compressor = zstd::bulk::Compressor::new(level)
-                .map_err(|e| Error::other(format!("cannot create a zstd compressor: {e}")))?;
+                .map_err(|e| Error::io(err::cannot_create_compressor(&e), &e))?;
             loop {
                 let raw = match raw_rx.recv() {
                     Ok(chunk) => chunk,
@@ -2258,9 +2833,9 @@ pub fn encrypt_file(
                 };
                 let raw_index = raw.index;
                 let raw_len = raw.data.len() as u64;
-                let compressed = compressor.compress(&raw.data).map_err(|e| {
-                    Error::other(format!("compressing chunk {raw_index} failed: {e}"))
-                })?;
+                let compressed = compressor
+                    .compress(&raw.data)
+                    .map_err(|e| Error::io(err::compress_failed(raw_index, &e), &e))?;
                 // Release the raw chunk before queueing the compressed one.
                 drop(raw);
                 progress_worker.fetch_add(raw_len, Ordering::Relaxed);
@@ -2278,9 +2853,7 @@ pub fn encrypt_file(
         match spawned {
             Ok(handle) => worker_handles.push(handle),
             Err(e) => {
-                first_error.get_or_insert_with(|| {
-                    Error::other(format!("cannot start a worker thread: {e}"))
-                });
+                first_error.get_or_insert_with(|| Error::io(err::cannot_start_worker(&e), &e));
                 break;
             }
         }
@@ -2312,7 +2885,7 @@ pub fn encrypt_file(
             None
         }
         Err(_) => {
-            first_error.get_or_insert_with(|| Error::other("the chunk reader thread panicked"));
+            first_error.get_or_insert_with(|| Error::other(err::CHUNK_READER_PANICKED));
             None
         }
     };
@@ -2329,75 +2902,92 @@ pub fn encrypt_file(
             first_error.get_or_insert(e);
         }
         Err(_) => {
-            first_error.get_or_insert_with(|| Error::other("the tar thread panicked"));
+            first_error.get_or_insert_with(|| Error::other(err::TAR_THREAD_PANICKED));
         }
     }
 
-    done.store(true, Ordering::Relaxed);
-    let _ = progress_handle.join();
+    finish_progress(&done, progress_handle);
 
     if let Some(message) = first_error {
-        return abandon_partial(&mut output_file, &coffin_path, message);
+        return Err(abandon_partial(
+            &mut output_file,
+            &coffin_path,
+            message,
+            &*reporter,
+        ));
     }
 
     let written = written.unwrap_or(0);
     let expected = expected.unwrap_or(0);
     if written != expected {
-        return abandon_partial(
+        return Err(abandon_partial(
             &mut output_file,
             &coffin_path,
-            Error::other(format!(
-                "only {written} of {expected} chunks were written, so the archive would be incomplete"
-            )),
-        );
+            Error::other(err::chunks_missing(written, expected)),
+            &*reporter,
+        ));
     }
 
     write_trailer(&mut output_file, &keys.data[..], written)?;
     output_file
         .flush()
-        .map_err(|e| Error::other(format!("cannot flush '{}': {e}", coffin_path.display())))?;
-    output_file.get_ref().sync_all().map_err(|e| {
-        Error::other(format!(
-            "cannot write '{}' to disk: {e}",
-            coffin_path.display()
-        ))
-    })?;
+        .map_err(|e| Error::io(err::cannot_flush(&coffin_path, &e), &e))?;
+    output_file
+        .get_ref()
+        .sync_all()
+        .map_err(|e| Error::io(err::cannot_write_to_disk(&coffin_path, &e), &e))?;
     drop(output_file);
 
     // Publish the archive, never replacing an existing one.
     if crypt_path.exists() {
-        return Err(Error::invalid_input(format!(
-            "'{}' already exists; refusing to overwrite it",
-            crypt_path.display()
-        )));
+        return Err(Error::invalid_input(err::already_exists(&crypt_path)));
     }
     match fs::hard_link(&coffin_path, &crypt_path) {
         Ok(()) => {
             let _ = fs::remove_file(&coffin_path);
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(Error::invalid_input(format!(
-                "'{}' already exists; refusing to overwrite it",
-                crypt_path.display()
-            )));
+            return Err(Error::invalid_input(err::already_exists(&crypt_path)));
         }
         Err(_) => {
             // Filesystems without hard links (exFAT, for instance); the name was
             // checked for collisions just above.
-            fs::rename(&coffin_path, &crypt_path).map_err(|e| {
-                Error::other(format!(
-                    "cannot rename '{}' to '{}': {e}",
-                    coffin_path.display(),
-                    crypt_path.display()
-                ))
-            })?;
+            fs::rename(&coffin_path, &crypt_path)
+                .map_err(|e| Error::io(err::cannot_rename(&coffin_path, &crypt_path, &e), &e))?;
         }
     }
     guard.keep = true;
     sync_dir(&base_dir);
-    report_skips(&tar_stats);
+    report_skips(&tar_stats, &*reporter);
 
-    Ok(crypt_path)
+    Ok(EncryptOutcome {
+        archive: crypt_path,
+        files: tar_stats.files,
+        bytes: total_input_size,
+        symlinks_skipped: tar_stats.symlinks_skipped,
+        special_files_skipped: tar_stats.others_skipped,
+        staging_files_skipped: tar_stats.staging_skipped,
+        unreadable: tar_stats.unreadable,
+        other_filesystems: tar_stats.other_filesystem,
+    })
+}
+
+/// Encrypt `inputs` into an archive next to the first input, with the default
+/// options, and say nothing.
+///
+/// This is [`encrypt_file`] for the common case:
+///
+/// ```no_run
+/// let outcome = crypt::encrypt(&["/data"], "correcthorse")?;
+/// println!("wrote {}", outcome.archive.display());
+/// # Ok::<(), crypt::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// The same as [`encrypt_file`].
+pub fn encrypt<P: AsRef<Path>>(inputs: &[P], password: &str) -> Result<EncryptOutcome> {
+    encrypt_file(inputs, password, None, &EncryptOptions::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -2415,21 +3005,133 @@ struct DecryptedChunk {
     data: Zeroizing<Vec<u8>>,
 }
 
+/// What [`decrypt_file`] produced.
+///
+/// [`DecryptOutcome::paths`] is what a caller normally wants; the other fields
+/// say whether anything came back under a different name or was left out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecryptOutcome {
+    /// The top-level entries that were moved into place, in the order they were
+    /// first seen. Each one is the output directory joined with the stored name,
+    /// so an archive holding one directory yields one path, not one per file.
+    pub paths: Vec<PathBuf>,
+    /// Entries restored under a different name, relative to the output
+    /// directory. Non-empty when a name was already taken in the destination or
+    /// when `compat` mapped two stored names onto one. A renamed directory also
+    /// lists the entries below it.
+    pub renamed: Vec<PathBuf>,
+    /// Entries that were in the archive but were not extracted: a special file,
+    /// an unsafe name, an unreadable entry, or one the partial recovery had to
+    /// drop because the cut ran through it.
+    pub skipped_entries: u64,
+    /// True when the archive was opened with [`DecryptOptions::partial`].
+    pub partial: bool,
+}
+
+impl DecryptOutcome {
+    /// True when the whole archive came back, under its own names.
+    ///
+    /// A partial recovery always reports `false`, even when nothing was actually
+    /// dropped: the caller asked for a `.coffin`, so it cannot know the missing
+    /// tail held nothing.
+    pub fn is_complete(&self) -> bool {
+        !self.partial && self.skipped_entries == 0 && self.renamed.is_empty()
+    }
+}
+
 /// Knobs for [`decrypt_file`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Build one from [`DecryptOptions::default`] and the `with_` methods:
+///
+/// ```
+/// use crypt::DecryptOptions;
+///
+/// // Restore a `.coffin` left by an interrupted run, the exFAT way.
+/// let options = DecryptOptions::default()
+///     .with_workers(8)
+///     .with_partial(true)
+///     .with_compat(true);
+/// assert!(options.partial && options.compat);
+/// ```
+///
+/// The defaults are four workers, strict authentication, byte-exact names and no
+/// reporter. The reporter is not part of equality.
+#[derive(Clone)]
 pub struct DecryptOptions {
     /// Worker threads used to decompress chunks. Zero is treated as one, and
     /// anything over 128 is capped at 128.
     pub workers: usize,
-    /// Recover whatever a partial (`.coffin`) archive contains instead of
-    /// demanding that it be complete. Wrong-password and per-chunk
-    /// authentication still fail: only the end-of-stream check is relaxed.
+    /// Recover whatever a partial archive contains instead of demanding that it
+    /// be complete.
+    ///
+    /// This is for the `.coffin` file an interrupted encryption leaves behind:
+    /// the CLI turns it on automatically for files with that extension. Every
+    /// chunk that authenticates is decrypted, the entry the cut ran through is
+    /// dropped and named in a warning, and [`DecryptOutcome::partial`] is set.
+    /// Wrong-password and per-chunk authentication still fail — only the
+    /// end-of-stream check is relaxed.
     pub partial: bool,
     /// Argon2id parameters `(mem_cost_kib, time_cost, parallelism)` used **only**
     /// for v1 archives, which store none of their own. Ignored for v2 and later,
     /// whose parameters come from the file. The CLI fills this in from
     /// `CryptConfig.toml`.
     pub legacy_kdf: (u32, u32, u32),
+    /// Restore names the way older builds did: characters exFAT/Win32 refuses
+    /// (`< > : " | ? * \` and control characters) become `_`, and a name whose
+    /// destination is already taken gets a `_1`, `_2` suffix instead of being
+    /// written over — at every depth.
+    ///
+    /// Off by default, where every name is restored byte for byte and only
+    /// structurally unsafe ones (`..`, an absolute path, an empty name, a NUL or
+    /// a `/` inside one) are refused.
+    pub compat: bool,
+    /// Where warnings, skip notices and progress go. `None` — the default — is
+    /// completely silent; the outcome still carries the facts.
+    pub reporter: Option<Arc<dyn Reporter>>,
+}
+
+impl DecryptOptions {
+    /// The defaults, spelled out: four workers, strict, byte-exact names, silent.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the worker count. Out-of-range values are clamped when the archive is
+    /// read, not here.
+    #[must_use]
+    pub fn with_workers(mut self, workers: usize) -> Self {
+        self.workers = workers;
+        self
+    }
+
+    /// Recover a partial (`.coffin`) archive instead of refusing it.
+    #[must_use]
+    pub fn with_partial(mut self, partial: bool) -> Self {
+        self.partial = partial;
+        self
+    }
+
+    /// Restore names the exFAT/Win32 way.
+    #[must_use]
+    pub fn with_compat(mut self, compat: bool) -> Self {
+        self.compat = compat;
+        self
+    }
+
+    /// Set the Argon2id parameters used for v1 archives
+    /// (`mem_cost_kib`, `time_cost`, `parallelism`).
+    #[must_use]
+    pub fn with_legacy_kdf(mut self, mem_cost_kib: u32, time_cost: u32, parallelism: u32) -> Self {
+        self.legacy_kdf = (mem_cost_kib, time_cost, parallelism);
+        self
+    }
+
+    /// Send warnings, skip notices and progress to `reporter`.
+    #[must_use]
+    pub fn with_reporter(mut self, reporter: Arc<dyn Reporter>) -> Self {
+        self.reporter = Some(reporter);
+        self
+    }
 }
 
 impl Default for DecryptOptions {
@@ -2438,90 +3140,118 @@ impl Default for DecryptOptions {
             workers: DEFAULT_NUM_WORKERS,
             partial: false,
             legacy_kdf: BUILT_IN_KDF,
+            compat: false,
+            reporter: None,
         }
     }
 }
 
-/// Decrypt one archive into `output_dir` (or next to the archive) and return the
-/// paths that were created, in the order they were seen.
+impl fmt::Debug for DecryptOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecryptOptions")
+            .field("workers", &self.workers)
+            .field("partial", &self.partial)
+            .field("legacy_kdf", &self.legacy_kdf)
+            .field("compat", &self.compat)
+            .field("reporter", &self.reporter.as_ref().map(|_| "<installed>"))
+            .finish()
+    }
+}
+
+impl PartialEq for DecryptOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.workers == other.workers
+            && self.partial == other.partial
+            && self.legacy_kdf == other.legacy_kdf
+            && self.compat == other.compat
+    }
+}
+
+impl Eq for DecryptOptions {}
+
+/// Decrypt one archive into `output_dir` (or next to the archive) and describe
+/// what came back.
 ///
 /// Everything is extracted into a hidden staging directory first and only moved
 /// into place after the trailer has authenticated, so a truncated or tampered
-/// file cannot leave partial output under the final names.
+/// file cannot leave partial output under the final names. `output_dir` is
+/// created if it does not exist; when it is `None` the result goes next to the
+/// archive. Nothing in the destination is ever overwritten: a name that is
+/// already taken gets a `_1`, `_2`, ... suffix and is listed in
+/// [`DecryptOutcome::renamed`].
+///
+/// Nothing is printed. Pass a [`Reporter`] in the options if a human should see
+/// the warnings and progress, and check [`DecryptOutcome::is_complete`] if the
+/// caller needs to know whether everything came back under its own name.
 ///
 /// # Errors
 ///
 /// [`Error::Authentication`] covers both a wrong password and tampering (they
 /// are deliberately indistinguishable). [`Error::Truncated`] means the archive
-/// ends early — pass `partial: true` in [`DecryptOptions`] to keep the readable
-/// part of a `.coffin` instead.
+/// ends early — pass [`DecryptOptions::with_partial`] to keep the readable part
+/// of a `.coffin` instead. Operating-system failures are [`Error::Io`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use crypt::DecryptOptions;
+///
+/// // A `.coffin` is the file an interrupted encryption leaves behind.
+/// let outcome = crypt::decrypt_file(
+///     "/backup/data-1f3a9c2b.coffin",
+///     "correcthorse",
+///     Some(std::path::Path::new("/restored")),
+///     &DecryptOptions::default().with_partial(true),
+/// )?;
+///
+/// assert!(outcome.partial);
+/// for path in &outcome.paths {
+///     println!("recovered {}", path.display());
+/// }
+/// # Ok::<(), crypt::Error>(())
+/// ```
 pub fn decrypt_file(
-    crypt_path: &Path,
+    crypt_path: impl AsRef<Path>,
     password: &str,
     output_dir: Option<&Path>,
     opts: &DecryptOptions,
-) -> Result<Vec<PathBuf>> {
+) -> Result<DecryptOutcome> {
+    let crypt_path = crypt_path.as_ref();
     let workers = opts.workers.clamp(1, MAX_WORKERS);
     let partial = opts.partial;
+    let compat = opts.compat;
+    let reporter: Arc<dyn Reporter> = opts
+        .reporter
+        .clone()
+        .unwrap_or_else(|| Arc::new(SilentReporter));
 
-    let mut file = File::open(crypt_path)
-        .map_err(|e| Error::other(format!("cannot open '{}': {e}", crypt_path.display())))?;
+    let mut file =
+        File::open(crypt_path).map_err(|e| Error::io(err::cannot_open(crypt_path, &e), &e))?;
     let raw = read_raw_header(&mut file)?;
 
-    // Derive the header key for the claimed version. v5 uses one KDF call for
-    // both keys; v1–v4 used a single key (or two, with the data params in the
-    // header).
-    let mut data_key = None;
-    let header_key = if raw.version >= VERSION_AUTHENTICATED_HEADER {
-        let keys = derive_keys(password, &raw.salt)?;
-        data_key = Some(keys.data);
-        keys.header
-    } else if raw.version >= 3 {
-        derive_single_key(
-            password,
-            &raw.salt,
-            HEADER_ARGON2_MEM_COST,
-            HEADER_ARGON2_TIME_COST,
-            HEADER_ARGON2_PARALLELISM,
-        )?
-    } else if raw.version == 2 {
-        let (mem, time, par) = raw
-            .clear_kdf
-            .ok_or_else(|| Error::malformed("v2 archive is missing its KDF parameters"))?;
-        validate_kdf_params(mem, time, par)?;
-        let key = derive_single_key(password, &raw.salt, mem, time, par)?;
-        data_key = Some(key.clone());
-        key
-    } else {
-        // v1 stored no KDF parameters at all: the caller's settings decide.
-        let (mem, time, par) = opts.legacy_kdf;
-        validate_kdf_params(mem, time, par)?;
-        let key = derive_single_key(password, &raw.salt, mem, time, par)?;
-        data_key = Some(key.clone());
-        key
-    };
+    let raw_password = password;
+    let password = normalized_password(raw_password);
 
-    let info = authenticate_header(&raw, &header_key[..], opts.legacy_kdf)?;
-
-    let data_key = match data_key {
-        Some(key) => key,
-        None => match info.kdf {
-            // v3/v4: if the data used the built-in params the header key is it.
-            Some((mem, time, par))
-                if (mem, time, par)
-                    == (
-                        HEADER_ARGON2_MEM_COST,
-                        HEADER_ARGON2_TIME_COST,
-                        HEADER_ARGON2_PARALLELISM,
-                    ) =>
-            {
-                header_key.clone()
+    // Decryption normalizes exactly like encryption does, so the composed and the
+    // decomposed spelling of one password are one password. An archive a library
+    // caller wrote before passwords were normalized used the bytes as given, so
+    // that spelling is tried too — but only after the normalized one failed, and
+    // only when NFC actually changed the text, which is what keeps an ASCII
+    // password from ever paying for a second key derivation. (Only a library
+    // caller can have such an archive: the CLI refused non-ASCII, so nothing it
+    // wrote was ever keyed on a spelling NFC would rewrite. The rescue works when
+    // that same spelling is given again, which is the case a caller can arrange.)
+    let (info, data_key) = match unlock_header(&raw, &password, opts.legacy_kdf) {
+        Ok(unlocked) => unlocked,
+        Err(e) => {
+            let retry = matches!(&e, Error::Authentication(_)) && *password != *raw_password;
+            if retry {
+                unlock_header(&raw, raw_password, opts.legacy_kdf)?
+            } else {
+                return Err(e);
             }
-            Some((mem, time, par)) => derive_single_key(password, &raw.salt, mem, time, par)?,
-            None => header_key.clone(),
-        },
+        }
     };
-    drop(header_key);
 
     let dest_root = match output_dir {
         Some(dir) => dir.to_path_buf(),
@@ -2543,24 +3273,28 @@ pub fn decrypt_file(
         .unwrap_or(0);
 
     let (raw_pipe_reader, raw_pipe_writer) =
-        os_pipe::pipe().map_err(|e| Error::other(format!("cannot create a pipe: {e}")))?;
+        os_pipe::pipe().map_err(|e| Error::io(err::cannot_create_pipe(&e), &e))?;
     let (compressed_tx, compressed_rx) = crossbeam_channel::bounded::<CompressedReadChunk>(workers);
     let (decrypted_tx, decrypted_rx) = crossbeam_channel::bounded::<DecryptedChunk>(workers * 2);
 
     let progress = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
-    let progress_handle =
-        spawn_progress_thread(Arc::clone(&progress), Arc::clone(&done), total_data_size);
+    let progress_handle = spawn_progress_thread(
+        Arc::clone(&progress),
+        Arc::clone(&done),
+        total_data_size,
+        Arc::clone(&reporter),
+    );
 
     let data_key = Arc::new(Zeroizing::new(data_key.to_vec()));
     let source_path = crypt_path.to_path_buf();
+    let reader_reporter = Arc::clone(&reporter);
 
     let chunk_reader_handle = thread::spawn(move || -> Result<u64> {
         let mut file = File::open(&source_path)
-            .map_err(|e| Error::other(format!("cannot open '{}': {e}", source_path.display())))?;
-        file.seek(io::SeekFrom::Start(header_skip)).map_err(|e| {
-            Error::other(format!("cannot seek in '{}': {e}", source_path.display()))
-        })?;
+            .map_err(|e| Error::io(err::cannot_open(&source_path, &e), &e))?;
+        file.seek(io::SeekFrom::Start(header_skip))
+            .map_err(|e| Error::io(err::cannot_seek(&source_path, &e), &e))?;
         let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
 
         let mut index: u64 = 0;
@@ -2571,7 +3305,7 @@ pub fn decrypt_file(
                     // A partial archive has no valid end of stream: take what is
                     // there and stop, rather than refusing the whole file.
                     Err(e) if partial => {
-                        eprintln!("[WARN] Partial archive, stopping at the cut: {e}");
+                        reader_reporter.warning(&warn::partial_stopping_at_cut(&e));
                         break;
                     }
                     Err(e) => return Err(e),
@@ -2606,7 +3340,7 @@ pub fn decrypt_file(
         let spawned = thread::Builder::new().spawn(move || -> Result<()> {
             // One decompression context per worker, reused for every chunk.
             let mut decompressor = Decompressor::new()
-                .map_err(|e| Error::other(format!("cannot create a zstd decompressor: {e}")))?;
+                .map_err(|e| Error::io(err::cannot_create_decompressor(&e), &e))?;
             loop {
                 let chunk = match compressed_rx.recv() {
                     Ok(chunk) => chunk,
@@ -2631,9 +3365,7 @@ pub fn decrypt_file(
         match spawned {
             Ok(handle) => worker_handles.push(handle),
             Err(e) => {
-                worker_error.get_or_insert_with(|| {
-                    Error::other(format!("cannot start a worker thread: {e}"))
-                });
+                worker_error.get_or_insert_with(|| Error::io(err::cannot_start_worker(&e), &e));
                 break;
             }
         }
@@ -2655,64 +3387,80 @@ pub fn decrypt_file(
             while let Some(chunk) = pending.remove(&next_index) {
                 pipe_buf
                     .write_all(&chunk.data)
-                    .map_err(|e| Error::other(format!("cannot write the decrypted stream: {e}")))?;
+                    .map_err(|e| Error::io(err::cannot_write_stream(&e), &e))?;
                 next_index += 1;
             }
             if pending.len() > max_pending {
-                return Err(Error::other(format!(
-                    "{} chunks arrived out of order and could not be written; the output would be \
-                     incomplete",
-                    pending.len()
-                )));
+                return Err(Error::other(err::chunks_out_of_order_output(pending.len())));
             }
         }
 
         if let Some(lowest) = pending.keys().min().copied() {
-            return Err(Error::other(format!(
-                "chunk {lowest} (and {} after it) could not be written; the output would be \
-                 incomplete",
-                pending.len()
-            )));
+            return Err(Error::other(err::chunk_gap_output(lowest, pending.len())));
         }
 
         pipe_buf
             .flush()
-            .map_err(|e| Error::other(format!("cannot flush the decrypted stream: {e}")))?;
+            .map_err(|e| Error::io(err::cannot_flush_stream(&e), &e))?;
         Ok(())
     });
 
     // Consume the decrypted tar on this thread. The archive is dropped at the end
     // of this block, which closes the pipe so the writer thread can finish — the
     // joins below must therefore happen after it.
+    let mut renamed: Vec<PathBuf> = Vec::new();
+    let mut skipped_entries = 0u64;
     let extract_result = {
         let reader = BufReader::with_capacity(8 * 1024 * 1024, raw_pipe_reader);
         if info.is_directory {
             let mut archive = tar::Archive::new(reader);
-            unpack_tar_sanitized(&mut archive, staging.path()).map(|result| {
+            unpack_tar_tree(
+                &mut archive,
+                staging.path(),
+                compat,
+                partial,
+                &*reporter,
+                &mut renamed,
+            )
+            .map(|result| {
+                skipped_entries = result.stats.skipped;
                 if result.stats.skipped > 0 {
-                    eprintln!(
-                        "[WARN] Skipped {} archive entr{} that could not be extracted safely.",
-                        result.stats.skipped,
-                        if result.stats.skipped == 1 {
-                            "y"
-                        } else {
-                            "ies"
-                        }
-                    );
+                    reporter.warning(&warn::skipped_entries(result.stats.skipped));
                 }
                 result.tops
             })
         } else {
-            let name = output_name_from_header(&info.name);
+            // The single-file path has no helper to report on, so say the same
+            // things the tar walk says about the one stored name.
+            if would_rename_for_compat(&info.name) {
+                let line = if compat {
+                    warn::compat_renamed(1)
+                } else {
+                    warn::names_not_exfat_safe(1)
+                };
+                reporter.warning(&line);
+            }
+            let name = output_name_from_header(&info.name, compat, &*reporter);
+            if compat && name.as_bytes() != info.name {
+                renamed.push(PathBuf::from(&name));
+            }
             let dest = staging.path().join(&name);
             let mut archive = tar::Archive::new(reader);
-            unpack_single_file(&mut archive, &dest).map(|()| vec![name])
+            // A cut single-file archive keeps nothing: the file it holds was
+            // never written in full, so there is no honest partial answer.
+            unpack_single_file(&mut archive, &dest, partial, &*reporter).map(|kept| {
+                if kept {
+                    vec![name]
+                } else {
+                    Vec::new()
+                }
+            })
         }
     };
 
     let reader_result = chunk_reader_handle
         .join()
-        .unwrap_or_else(|_| Err(Error::other("the chunk reader thread panicked")));
+        .unwrap_or_else(|_| Err(Error::other(err::CHUNK_READER_PANICKED)));
     for handle in worker_handles {
         if let Ok(Err(e)) = handle.join() {
             worker_error.get_or_insert(e);
@@ -2720,10 +3468,9 @@ pub fn decrypt_file(
     }
     let writer_result = pipe_writer_handle
         .join()
-        .unwrap_or_else(|_| Err(Error::other("the pipe writer thread panicked")));
+        .unwrap_or_else(|_| Err(Error::other(err::PIPE_WRITER_PANICKED)));
 
-    done.store(true, Ordering::Relaxed);
-    let _ = progress_handle.join();
+    finish_progress(&done, progress_handle);
 
     // A partial archive is recovered on purpose, so its failures are warnings.
     // Everything else keeps the strict behaviour: the crypto verdict wins,
@@ -2733,13 +3480,13 @@ pub fn decrypt_file(
         if !partial {
             return Err(e);
         }
-        eprintln!("[WARN] Partial archive: {e}");
+        reporter.warning(&warn::partial_error(&e));
     }
     let tops = match extract_result {
         Ok(tops) => tops,
         Err(e) if partial => {
-            eprintln!("[WARN] Partial archive: {e}");
-            eprintln!("[WARN] Keeping the entries that were readable before the cut.");
+            reporter.warning(&warn::partial_error(&e));
+            reporter.warning(warn::KEEPING_READABLE);
             staged_tops(staging.path())?
         }
         Err(e) => return Err(e),
@@ -2748,31 +3495,69 @@ pub fn decrypt_file(
         if !partial {
             return Err(e);
         }
-        eprintln!("[WARN] Partial archive: {e}");
+        reporter.warning(&warn::partial_error(&e));
     }
     if let Err(e) = writer_result {
         if !partial {
             return Err(e);
         }
-        eprintln!("[WARN] Partial archive: {e}");
+        reporter.warning(&warn::partial_error(&e));
     }
 
     // Everything authenticated; move the results into place. Collision suffixes
-    // are assigned here, at commit time, so a failed file cannot shift them.
+    // are assigned here, at commit time, so a failed file cannot shift them, and
+    // an existing entry is renamed rather than replaced.
     let mut created = Vec::with_capacity(tops.len());
     for top in &tops {
         let from = staging.path().join(top);
+        // A partial archive can name an entry it then had to drop, because the
+        // cut ran through it. Nothing was kept under that name, so there is
+        // nothing to move and nothing to report.
+        if !from.exists() {
+            continue;
+        }
         let final_name = unique_component(&dest_root, top);
+        if final_name != *top {
+            reporter.warning(&warn::already_exists_suffixed(
+                &top.to_string_lossy(),
+                &dest_root,
+                &final_name.to_string_lossy(),
+            ));
+            renamed.push(PathBuf::from(&final_name));
+        }
         let to = dest_root.join(&final_name);
-        fs::rename(&from, &to)
-            .map_err(|e| Error::other(format!("cannot move '{}' into place: {e}", to.display())))?;
+        fs::rename(&from, &to).map_err(|e| Error::io(err::cannot_move_into_place(&to, &e), &e))?;
         created.push(to);
     }
     // The staging directory is empty now; dropping it removes the shell.
     drop(staging);
     sync_dir(&dest_root);
 
-    Ok(created)
+    Ok(DecryptOutcome {
+        paths: created,
+        renamed,
+        skipped_entries,
+        partial,
+    })
+}
+
+/// Decrypt `archive` next to itself, with the default options, and say nothing.
+///
+/// This is [`decrypt_file`] for the common case:
+///
+/// ```no_run
+/// let outcome = crypt::decrypt("/data/docs-1f3a9c2b.crypt", "correcthorse")?;
+/// for path in &outcome.paths {
+///     println!("restored {}", path.display());
+/// }
+/// # Ok::<(), crypt::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// The same as [`decrypt_file`].
+pub fn decrypt(crypt_path: impl AsRef<Path>, password: &str) -> Result<DecryptOutcome> {
+    decrypt_file(crypt_path, password, None, &DecryptOptions::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -2780,14 +3565,14 @@ pub fn decrypt_file(
 // ---------------------------------------------------------------------------
 
 const USAGE: &str = "Usage: crypt [-e|-E|-d|-D] <path>[,<path>...] [--workers <N>] [--level <n>] \
-[--output <dir>] [--password-stdin]
+[--output <dir>] [--compat] [--password-stdin]
        Run with no arguments for interactive mode.";
 
 const HELP: &str = "crypt — store large amounts of data privately.
 
 USAGE:
     crypt -e <path>[,<path>...] [--output <dir>] [--workers <N>] [--level <n>]
-    crypt -d <file.crypt>[,<file.crypt>...] [--output <dir>] [--workers <N>]
+    crypt -d <file.crypt>[,<file.crypt>...] [--output <dir>] [--workers <N>] [--compat]
     crypt                       (interactive; takes no arguments)
 
 OPTIONS:
@@ -2799,6 +3584,11 @@ OPTIONS:
                             Defaults to num_workers from the config.
     --level <n>             Zstd level (1-22); values outside the range are clamped.
                             Ignored when decrypting.
+    --compat                Rename while restoring the exFAT/Win32 way: characters
+                            those filesystems refuse (< > : \" | ? * \\ and control
+                            characters) become '_', and a name already taken gets
+                            a '_1', '_2' suffix, at every depth. Names are restored
+                            byte for byte when this is off. Ignored when encrypting.
     --password-stdin        Read the password from stdin instead of the terminal.
                             At most 4096 bytes, and at most one line. Arguments
                             are never used for passwords: they are world-readable
@@ -2827,6 +3617,12 @@ SKIPS:
     filesystem: those two add a warning to stderr saying the archive is valid but
     is not a full copy.
 
+RECOVERY:
+    A file ending in `.coffin` is an interrupted encryption. Decrypting one
+    recovers every entry that finished writing, drops the entry the cut ran
+    through and names it in a warning. A `.coffin` cut too early to hold one
+    complete entry recovers nothing and says so.
+
 EXIT STATUS:
     0  success
     1  one or more inputs failed (decrypt continues past a bad file)
@@ -2844,6 +3640,7 @@ struct CliArgs {
     pub level: Option<i32>,
     pub output: Option<PathBuf>,
     pub password_stdin: bool,
+    pub compat: bool,
     pub help: bool,
     pub version: bool,
 }
@@ -2853,10 +3650,7 @@ struct CliArgs {
 /// through `OsStr` untouched instead.
 fn flag_value_str(flag: &str, value: &OsStr) -> Result<String> {
     value.to_str().map(str::to_owned).ok_or_else(|| {
-        Error::invalid_input(format!(
-            "{flag} expects UTF-8 text, got '{}'",
-            value.to_string_lossy()
-        ))
+        Error::invalid_input(err::flag_value_not_utf8(flag, &value.to_string_lossy()))
     })
 }
 
@@ -2865,37 +3659,27 @@ fn parse_worker_count(value: &OsStr) -> Result<usize> {
     match text.trim().parse::<usize>() {
         Ok(n) if n >= 1 => {
             if n > MAX_WORKERS {
-                eprintln!(
-                    "[WARN] --workers {n} exceeds the maximum of {MAX_WORKERS}; using {MAX_WORKERS}."
-                );
+                eprintln!("{}", warn::workers_clamped(n));
                 Ok(MAX_WORKERS)
             } else {
                 Ok(n)
             }
         }
-        _ => Err(Error::invalid_input(format!(
-            "--workers expects a positive integer, got '{}'",
-            text.trim()
-        ))),
+        _ => Err(Error::invalid_input(err::bad_worker_count(text.trim()))),
     }
 }
 
 fn parse_compression_level(value: &OsStr) -> Result<i32> {
     let text = flag_value_str("--level", value)?;
-    let level = text.trim().parse::<i32>().map_err(|_| {
-        Error::invalid_input(format!("--level expects an integer, got '{}'", text.trim()))
-    })?;
+    let level = text
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| Error::invalid_input(err::bad_level(text.trim())))?;
     if level > MAX_ZSTD_LEVEL {
-        eprintln!(
-            "[WARN] --level {} exceeds the maximum of {}; using {}.",
-            level, MAX_ZSTD_LEVEL, MAX_ZSTD_LEVEL
-        );
+        eprintln!("{}", warn::level_clamped_high(level));
         Ok(MAX_ZSTD_LEVEL)
     } else if level < MIN_ZSTD_LEVEL {
-        eprintln!(
-            "[WARN] --level {} is below the minimum of {}; using {}.",
-            level, MIN_ZSTD_LEVEL, MIN_ZSTD_LEVEL
-        );
+        eprintln!("{}", warn::level_clamped_low(level));
         Ok(MIN_ZSTD_LEVEL)
     } else {
         Ok(level)
@@ -2931,6 +3715,8 @@ fn parse_cli<S: AsRef<OsStr>>(args: &[S]) -> Result<CliArgs> {
             parsed.version = true;
         } else if arg == OsStr::new("--password-stdin") {
             parsed.password_stdin = true;
+        } else if arg == OsStr::new("--compat") {
+            parsed.compat = true;
         } else if arg == OsStr::new("-e") || arg == OsStr::new("-E") {
             set_operation(&mut parsed.operation, 'e')?;
         } else if arg == OsStr::new("-d") || arg == OsStr::new("-D") {
@@ -2941,7 +3727,7 @@ fn parse_cli<S: AsRef<OsStr>>(args: &[S]) -> Result<CliArgs> {
             i += 1;
             let value = args
                 .get(i)
-                .ok_or_else(|| Error::invalid_input("--workers requires a value"))?;
+                .ok_or_else(|| Error::invalid_input(err::WORKERS_REQUIRE_VALUE))?;
             parsed.workers = Some(parse_worker_count(value.as_ref())?);
         } else if let Some(value) = bytes.strip_prefix(b"--level=") {
             parsed.level = Some(parse_compression_level(OsStr::from_bytes(value))?);
@@ -2949,7 +3735,7 @@ fn parse_cli<S: AsRef<OsStr>>(args: &[S]) -> Result<CliArgs> {
             i += 1;
             let value = args
                 .get(i)
-                .ok_or_else(|| Error::invalid_input("--level requires a value"))?;
+                .ok_or_else(|| Error::invalid_input(err::LEVEL_REQUIRES_VALUE))?;
             parsed.level = Some(parse_compression_level(value.as_ref())?);
         } else if let Some(value) = bytes.strip_prefix(b"--output=") {
             parsed.output = Some(PathBuf::from(OsString::from_vec(value.to_vec())));
@@ -2957,12 +3743,11 @@ fn parse_cli<S: AsRef<OsStr>>(args: &[S]) -> Result<CliArgs> {
             i += 1;
             let value = args
                 .get(i)
-                .ok_or_else(|| Error::invalid_input("--output requires a value"))?;
+                .ok_or_else(|| Error::invalid_input(err::OUTPUT_REQUIRES_VALUE))?;
             parsed.output = Some(PathBuf::from(value.as_ref()));
         } else if bytes.first() == Some(&b'-') && arg != OsStr::new("-") {
-            return Err(Error::invalid_input(format!(
-                "unknown flag '{}'",
-                arg.to_string_lossy()
+            return Err(Error::invalid_input(err::unknown_flag(
+                &arg.to_string_lossy(),
             )));
         } else {
             push_paths(&mut parsed.paths, arg);
@@ -3017,9 +3802,7 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 
 fn set_operation(operation: &mut Option<char>, op: char) -> Result<()> {
     match operation {
-        Some(existing) if *existing != op => {
-            Err(Error::invalid_input("conflicting operation flags"))
-        }
+        Some(existing) if *existing != op => Err(Error::invalid_input(err::CONFLICTING_OPERATIONS)),
         _ => {
             *operation = Some(op);
             Ok(())
@@ -3033,35 +3816,34 @@ fn validate_input_paths(paths: Vec<PathBuf>, operation: char) -> Vec<PathBuf> {
     for path in paths {
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                eprintln!(
-                    "[WARN] Skipping symlink '{}': pass the real path instead.",
-                    path.display()
-                );
+                eprintln!("{}", warn::skipping_input_symlink(&path));
             }
             Ok(meta) if operation == 'e' && (meta.is_file() || meta.is_dir()) => {
-                println!("Added: {}", path.display());
+                println!("{}", info::added(&path));
                 valid.push(path);
             }
             Ok(meta) if operation == 'd' && meta.is_file() => {
-                println!("Added: {}", path.display());
+                println!("{}", info::added(&path));
                 valid.push(path);
             }
             Ok(_) => {
                 eprintln!(
-                    "[WARN] Skipping '{}': not a {}.",
-                    path.display(),
-                    if operation == 'e' {
-                        "file or directory"
-                    } else {
-                        "regular .crypt file"
-                    }
+                    "{}",
+                    warn::skipping_wrong_kind(
+                        &path,
+                        if operation == 'e' {
+                            "file or directory"
+                        } else {
+                            "regular .crypt file"
+                        }
+                    )
                 );
             }
             Err(e) => {
                 if e.kind() == io::ErrorKind::NotFound {
-                    eprintln!("[WARN] Path does not exist: {}. Skipping.", path.display());
+                    eprintln!("{}", warn::path_does_not_exist(&path));
                 } else {
-                    eprintln!("[WARN] Skipping '{}': {e}", path.display());
+                    eprintln!("{}", warn::skipping(&path, &e));
                 }
             }
         }
@@ -3074,17 +3856,10 @@ fn ensure_output_dir(dir: &Path) -> Result<()> {
         return Ok(());
     }
     if dir.exists() {
-        return Err(Error::invalid_input(format!(
-            "output path '{}' exists but is not a directory",
-            dir.display()
-        )));
+        return Err(Error::invalid_input(err::output_not_a_directory(dir)));
     }
-    fs::create_dir_all(dir)
-        .map_err(|e| Error::other(format!("cannot create '{}': {e}", dir.display())))?;
-    eprintln!(
-        "[WARN] Output directory did not exist; created '{}'.",
-        dir.display()
-    );
+    fs::create_dir_all(dir).map_err(|e| Error::io(err::cannot_create(dir, &e), &e))?;
+    eprintln!("{}", warn::output_dir_created(dir));
     Ok(())
 }
 
@@ -3098,7 +3873,7 @@ fn read_line(prompt: &str) -> Result<Option<String>> {
     let mut line = String::new();
     let read = io::stdin()
         .read_line(&mut line)
-        .map_err(|e| Error::other(format!("cannot read from stdin: {e}")))?;
+        .map_err(|e| Error::io(err::cannot_read_stdin(&e), &e))?;
     if read == 0 {
         println!();
         return Ok(None);
@@ -3108,21 +3883,21 @@ fn read_line(prompt: &str) -> Result<Option<String>> {
 
 fn get_choice() -> Result<char> {
     loop {
-        let input = match read_line("Enter 'e' to encrypt or 'd' to decrypt.")? {
+        let input = match read_line(info::ENTER_CHOICE)? {
             Some(input) => input,
-            None => return Err(Error::invalid_input("no choice was entered (input ended)")),
+            None => return Err(Error::invalid_input(err::NO_CHOICE_ENTERED)),
         };
         match input.as_str() {
             "e" => return Ok('e'),
             "d" => return Ok('d'),
             "" => continue,
-            _ => println!("Invalid choice, please enter 'e' or 'd'."),
+            _ => println!("{}", info::INVALID_CHOICE),
         }
     }
 }
 
 fn get_input_paths() -> Vec<PathBuf> {
-    println!("Enter paths (one per line, blank line to finish):");
+    println!("{}", info::ENTER_PATHS);
     let mut paths = Vec::new();
     loop {
         let mut line = String::new();
@@ -3130,7 +3905,7 @@ fn get_input_paths() -> Vec<PathBuf> {
             Ok(0) => break,
             Ok(_) => {}
             Err(e) => {
-                eprintln!("[WARN] Cannot read a path from stdin: {e}");
+                eprintln!("{}", warn::cannot_read_path_from_stdin(&e));
                 break;
             }
         }
@@ -3147,30 +3922,26 @@ fn get_input_paths() -> Vec<PathBuf> {
 }
 
 fn get_output_dir() -> Option<PathBuf> {
-    let input =
-        match read_line("Enter output directory (or press Enter to use the source's directory):") {
-            Ok(Some(input)) => input,
-            Ok(None) => {
-                eprintln!("[WARN] Input ended; using the source's directory.");
-                return None;
-            }
-            Err(e) => {
-                eprintln!("[WARN] {e}. Using the source's directory.");
-                return None;
-            }
-        };
+    let input = match read_line(info::ENTER_OUTPUT_DIR) {
+        Ok(Some(input)) => input,
+        Ok(None) => {
+            eprintln!("{}", warn::INPUT_ENDED_USING_SOURCE_DIR);
+            return None;
+        }
+        Err(e) => {
+            eprintln!("{}", warn::using_source_directory(&e));
+            return None;
+        }
+    };
     if input.is_empty() {
         return None;
     }
     let path = PathBuf::from(&input);
     if path.is_dir() {
-        println!("Output directory: {}", path.display());
+        println!("{}", info::output_directory(&path));
         Some(path)
     } else {
-        eprintln!(
-            "[WARN] '{}' is not a directory. Using the source's directory.",
-            input
-        );
+        eprintln!("{}", warn::not_a_directory(&input));
         None
     }
 }
@@ -3181,9 +3952,17 @@ fn get_output_dir() -> Option<PathBuf> {
 
 /// Run the whole program with UTF-8 arguments and return the process exit code.
 ///
+/// This is the CLI, not a quiet library call. It reads (and on first use writes)
+/// `CryptConfig.toml`, may prompt on the terminal, prints to stdout and stderr,
+/// and returns the exit status the binary uses: `0` success, `1` if any input
+/// failed, `2` for a usage error. Use [`encrypt`] or [`decrypt`] from a library.
+///
 /// Everything cheap happens first: arguments, paths and the output directory are
 /// all checked before the password prompt and the (deliberately expensive) key
 /// derivation, so a typo does not cost 512 MiB of Argon2id.
+///
+/// Arguments are `String`s here, so a path that is not valid UTF-8 cannot be
+/// passed; [`run_os`] is the version that keeps raw bytes intact.
 pub fn run(args: &[String]) -> i32 {
     let args: Vec<OsString> = args.iter().map(OsString::from).collect();
     run_os(&args)
@@ -3195,11 +3974,14 @@ pub fn run(args: &[String]) -> i32 {
 /// still a usable path, and turning it into a `String` (as [`run`] has to) would
 /// either panic or mangle it, so nothing here round-trips an argument through
 /// `String`.
+///
+/// Like [`run`], this is the CLI: it reads and may create the config file,
+/// prompts, and prints. See [`run`] for the exit statuses.
 pub fn run_os(args: &[OsString]) -> i32 {
     let cli = match parse_cli(args) {
         Ok(cli) => cli,
         Err(e) => {
-            eprintln!("Error: {e}");
+            eprintln!("{}", err::cli_error(&e));
             eprintln!("{USAGE}");
             return 2;
         }
@@ -3224,12 +4006,12 @@ pub fn run_os(args: &[OsString]) -> i32 {
     let interactive = args.is_empty();
     if !interactive {
         if cli.operation.is_none() {
-            eprintln!("Error: specify -e/-E (encrypt) or -d/-D (decrypt).");
+            eprintln!("{}", err::NO_OPERATION);
             eprintln!("{USAGE}");
             return 2;
         }
         if cli.paths.is_empty() {
-            eprintln!("Error: no paths provided.");
+            eprintln!("{}", err::NO_PATHS);
             eprintln!("{USAGE}");
             return 2;
         }
@@ -3238,10 +4020,7 @@ pub fn run_os(args: &[OsString]) -> i32 {
     let requested_workers = cli.workers.unwrap_or(config.num_workers);
     let workers = requested_workers.clamp(1, MAX_WORKERS);
     if workers != requested_workers {
-        eprintln!(
-            "[WARN] {requested_workers} worker(s) requested; using {workers} (the valid range is \
-             1..={MAX_WORKERS})."
-        );
+        eprintln!("{}", warn::workers_out_of_range(requested_workers, workers));
     }
 
     let level = match cli.level {
@@ -3250,10 +4029,7 @@ pub fn run_os(args: &[OsString]) -> i32 {
             let configured = config.zstd_compression_level;
             let clamped = configured.clamp(MIN_ZSTD_LEVEL, MAX_ZSTD_LEVEL);
             if clamped != configured {
-                eprintln!(
-                    "[WARN] zstd_compression_level {} is out of range ({}..={}); using {}.",
-                    configured, MIN_ZSTD_LEVEL, MAX_ZSTD_LEVEL, clamped
-                );
+                eprintln!("{}", warn::config_level_out_of_range(configured, clamped));
             }
             clamped
         }
@@ -3264,14 +4040,20 @@ pub fn run_os(args: &[OsString]) -> i32 {
         None => match get_choice() {
             Ok(op) => op,
             Err(e) => {
-                eprintln!("Error: {e}");
+                eprintln!("{}", err::cli_error(&e));
                 return 1;
             }
         },
     };
     if operation == 'd' && cli.level.is_some() {
-        eprintln!("[WARN] --level has no effect when decrypting; ignoring it.");
+        eprintln!("{}", warn::LEVEL_NO_EFFECT_ON_DECRYPT);
     }
+    if operation == 'e' && cli.compat {
+        eprintln!("{}", warn::COMPAT_NO_EFFECT_ON_ENCRYPT);
+    }
+    // `--compat` turns renaming on; the config can do it too, so a machine that
+    // restores onto exFAT does not have to pass the flag every time.
+    let compat = cli.compat || config.compat;
 
     let candidates = if interactive {
         get_input_paths()
@@ -3280,7 +4062,7 @@ pub fn run_os(args: &[OsString]) -> i32 {
     };
     let paths = validate_input_paths(candidates, operation);
     if paths.is_empty() {
-        eprintln!("No usable input paths; nothing to do.");
+        eprintln!("{}", info::NO_USABLE_INPUTS);
         return 1;
     }
 
@@ -3291,7 +4073,7 @@ pub fn run_os(args: &[OsString]) -> i32 {
     };
     if let Some(dir) = &output_dir {
         if let Err(e) = ensure_output_dir(dir) {
-            eprintln!("Error: {e}");
+            eprintln!("{}", err::cli_error(&e));
             return 1;
         }
     }
@@ -3304,14 +4086,14 @@ pub fn run_os(args: &[OsString]) -> i32 {
     let password = match read_password(operation == 'e', source) {
         Ok(password) => password,
         Err(e) => {
-            eprintln!("Error: {e}");
+            eprintln!("{}", err::cli_error(&e));
             return 1;
         }
     };
 
     if operation == 'e' {
         if let Err(e) = validate_password_for_encrypt(&password) {
-            eprintln!("Error: {e}");
+            eprintln!("{}", err::cli_error(&e));
             return 1;
         }
     }
@@ -3322,76 +4104,88 @@ pub fn run_os(args: &[OsString]) -> i32 {
         .map(|n| n.get())
         .unwrap_or(1);
     println!(
-        "Detected {detected_cores} CPU cores. Using {workers} worker(s) ({}).",
-        if cli.workers.is_some() {
-            "--workers"
-        } else {
-            "config"
-        }
+        "{}",
+        info::detected_cores(
+            detected_cores,
+            workers,
+            if cli.workers.is_some() {
+                "--workers"
+            } else {
+                "config"
+            }
+        )
     );
 
+    // The CLI is the one caller that wants the human-facing output, so it
+    // installs the console reporter. The library entry points themselves print
+    // nothing.
+    let console: Arc<dyn Reporter> = Arc::new(ConsoleReporter);
+
     if operation == 'e' {
-        let opts = EncryptOptions { workers, level };
+        let opts = EncryptOptions::default()
+            .with_workers(workers)
+            .with_level(level)
+            .with_reporter(Arc::clone(&console));
         match encrypt_file(&paths, &password, output_dir.as_deref(), &opts) {
-            Ok(path) => {
+            Ok(outcome) => {
+                let path = outcome.archive;
                 let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                println!(
-                    "Encryption complete: {} ({} MB)",
-                    path.display(),
-                    size / (1024 * 1024)
-                );
+                println!("{}", info::encryption_complete(&path, size / (1024 * 1024)));
                 0
             }
             Err(e) => {
-                eprintln!("Error: {e}");
+                eprintln!("{}", err::cli_error(&e));
                 1
             }
         }
     } else {
-        let opts = DecryptOptions {
-            workers,
-            partial: false,
+        let base_opts = DecryptOptions::default()
+            .with_workers(workers)
+            .with_compat(compat)
             // Only consulted for v1 archives; the config is where they have
             // always lived.
-            legacy_kdf: (
+            .with_legacy_kdf(
                 config.argon2_mem_cost,
                 config.argon2_time_cost,
                 config.argon2_parallelism,
-            ),
-        };
+            )
+            .with_reporter(Arc::clone(&console));
         let mut failed = 0usize;
         for path in &paths {
             // A `.coffin` is an interrupted run by definition: recover whatever
             // it holds instead of refusing it.
-            let opts = DecryptOptions {
-                partial: path
-                    .extension()
+            let opts = base_opts.clone().with_partial(
+                path.extension()
                     .map(|e| e.to_string_lossy() == "coffin")
                     .unwrap_or(false),
-                ..opts
-            };
+            );
             if opts.partial {
-                eprintln!(
-                    "[WARN] '{}' is a partial archive; recovering whatever it contains.",
-                    path.display()
-                );
+                eprintln!("{}", warn::recovering_partial(path));
             }
-            println!("Decrypting {}...", path.display());
+            println!("{}", info::decrypting(path));
             // One bad file does not stop the batch.
             match decrypt_file(path, &password, output_dir.as_deref(), &opts) {
-                Ok(created) => {
-                    let names: Vec<String> =
-                        created.iter().map(|p| p.display().to_string()).collect();
-                    println!("Decrypted into: {}", names.join(", "));
+                // A `.coffin` cut before anything finished has nothing to show;
+                // an empty "Decrypted into:" line would read as a success.
+                Ok(outcome) if outcome.paths.is_empty() => {
+                    println!("{}", info::nothing_recovered(path));
+                }
+                Ok(outcome) => {
+                    let names: Vec<String> = outcome
+                        .paths
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect();
+                    println!("{}", info::decrypted_into(&names));
                 }
                 Err(e) => {
-                    eprintln!("Error: '{}': {e}", path.display());
+                    eprintln!("{}", err::file_failed(path, &e));
                     failed += 1;
                 }
             }
         }
         if failed > 0 {
-            eprintln!("{failed} of {} file(s) failed.", paths.len());
+            eprintln!("{}", warn::some_files_failed(failed, paths.len()));
             1
         } else {
             0
@@ -3455,7 +4249,10 @@ mod tests {
         write_header(&mut out, false, &name, &salt(), &HK).unwrap();
         let (_, info) = open(&out).unwrap();
         assert_eq!(info.name, name.to_vec());
-        assert_eq!(output_name_from_header(&info.name).as_bytes(), name);
+        assert_eq!(
+            output_name_from_header(&info.name, false, &SilentReporter).as_bytes(),
+            name
+        );
     }
 
     #[test]
@@ -3771,38 +4568,174 @@ mod tests {
 
     #[test]
     fn unusable_names_are_rejected() {
-        for name in [&b""[..], b".", b"..", b"a/b", b"a\0b"] {
-            assert!(sanitize_name_bytes(name).is_none(), "{name:?}");
+        // Structural checks are the same in both modes: --compat renames, it
+        // never lets a separator or a parent reference through.
+        for compat in [false, true] {
+            for name in [&b""[..], b".", b"..", b"a/b", b"a\0b"] {
+                assert!(sanitize_name_bytes(name, compat).is_none(), "{name:?}");
+            }
         }
     }
 
     #[test]
-    fn illegal_characters_are_replaced_not_dropped() {
-        assert_eq!(sanitize_name_bytes(b"a:b*c?").unwrap(), b"a_b_c_");
-        assert_eq!(sanitize_name_bytes(b"back\\slash").unwrap(), b"back_slash");
-        assert_eq!(sanitize_name_bytes(b"tab\there").unwrap(), b"tab\there");
-        // Non-UTF-8 bytes are preserved verbatim.
-        assert_eq!(sanitize_name_bytes(b"bad\xffname").unwrap(), b"bad\xffname");
+    fn illegal_characters_are_only_replaced_in_compat_mode() {
+        // The default restores what was stored, byte for byte.
+        assert_eq!(sanitize_name_bytes(b"a:b*c?", false).unwrap(), b"a:b*c?");
+        assert_eq!(
+            sanitize_name_bytes(b"back\\slash", false).unwrap(),
+            b"back\\slash"
+        );
+        assert_eq!(
+            sanitize_name_bytes(b"tab\there", false).unwrap(),
+            b"tab\there"
+        );
+        // --compat maps them to '_' instead.
+        assert_eq!(sanitize_name_bytes(b"a:b*c?", true).unwrap(), b"a_b_c_");
+        assert_eq!(
+            sanitize_name_bytes(b"back\\slash", true).unwrap(),
+            b"back_slash"
+        );
+        assert_eq!(
+            sanitize_name_bytes(b"tab\there", true).unwrap(),
+            b"tab\there",
+            "a tab is legal on both filesystems"
+        );
+        // Non-UTF-8 bytes are preserved verbatim either way.
+        for compat in [false, true] {
+            assert_eq!(
+                sanitize_name_bytes(b"bad\xffname", compat).unwrap(),
+                b"bad\xffname"
+            );
+        }
     }
 
     #[test]
     fn path_traversal_is_rejected_structurally() {
-        let components = |p: &str| sanitized_components(Path::new(p));
+        let components = |p: &str| tar_path_components(Path::new(p));
         assert_eq!(components("a/b").unwrap().len(), 2);
         assert_eq!(components("./a").unwrap().len(), 1);
         assert!(components("a/../b").is_none(), "parent dir must be refused");
         assert!(components("../b").is_none());
         assert!(components("/etc/passwd").is_none(), "absolute paths too");
         assert!(components("").is_none());
+
+        // Components come back exactly as stored: mapping is a separate step, so
+        // `a:b` can still be distinguished from `a_b`.
+        assert_eq!(components("a:b").unwrap(), vec![OsString::from("a:b")]);
     }
 
     #[test]
-    fn output_name_from_header_falls_back() {
-        assert_eq!(output_name_from_header(b"ok.txt").as_bytes(), b"ok.txt");
+    fn output_name_from_header_is_byte_exact_unless_compat() {
+        let reporter = SilentReporter;
         assert_eq!(
-            output_name_from_header(b"..").as_bytes(),
+            output_name_from_header(b"ok.txt", false, &reporter).as_bytes(),
+            b"ok.txt"
+        );
+        // A name exFAT refuses survives the default restore untouched.
+        assert_eq!(
+            output_name_from_header(b"a:b", false, &reporter).as_bytes(),
+            b"a:b"
+        );
+        assert_eq!(
+            output_name_from_header(b"a:b", true, &reporter).as_bytes(),
+            b"a_b"
+        );
+        // An unusable name falls back in both modes.
+        assert_eq!(
+            output_name_from_header(b"..", false, &reporter).as_bytes(),
             b"decrypted_output"
         );
+        assert_eq!(
+            output_name_from_header(b"..", true, &reporter).as_bytes(),
+            b"decrypted_output"
+        );
+    }
+
+    #[test]
+    fn compat_collisions_are_suffixed_not_overwritten() {
+        let dir = scratch_dir("compat-unique");
+        let stored = Path::new("a:b");
+        let reporter = SilentReporter;
+        let mut used: HashMap<PathBuf, HashSet<OsString>> = HashMap::new();
+
+        // The first one becomes `a_b`.
+        let (first, was_taken) =
+            unique_extracted_name(&mut used, &dir, OsString::from("a_b"), stored, &reporter);
+        assert_eq!(first, "a_b");
+        assert!(!was_taken);
+        fs::write(dir.join(&first), b"first").unwrap();
+
+        // So the second, which only collides because --compat renamed them onto
+        // each other, is suffixed rather than written over.
+        let (second, was_taken) =
+            unique_extracted_name(&mut used, &dir, OsString::from("a_b"), stored, &reporter);
+        assert_eq!(second, "a_b_1");
+        assert!(was_taken);
+        fs::write(dir.join(&second), b"second").unwrap();
+
+        // The handed-out set keeps counting even if nothing is on disk.
+        let mut used: HashMap<PathBuf, HashSet<OsString>> = HashMap::new();
+        let names: Vec<OsString> = (0..3)
+            .map(|_| {
+                unique_extracted_name(&mut used, &dir, OsString::from("x"), stored, &reporter).0
+            })
+            .collect();
+        assert_eq!(names, vec!["x", "x_1", "x_2"]);
+
+        // The first file is untouched by any of it.
+        assert_eq!(fs::read(dir.join("a_b")).unwrap(), b"first");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn partial_extraction_drops_the_entry_cut_by_the_break() {
+        // Two stored files, cut inside the second one's data: what a `.coffin`
+        // looks like after the machine dies mid-write.
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            for (name, data) in [
+                ("first.txt", &b"complete"[..]),
+                ("second.txt", &b"truncated"[..]),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(0o644);
+                header.set_size(data.len() as u64);
+                header.set_path(name).unwrap();
+                header.set_cksum();
+                builder.append(&header, data).unwrap();
+            }
+            builder.into_inner().unwrap();
+        }
+
+        let dir = scratch_dir("partial-unit");
+        // First header (512) + its padded data (512) + second header (512), then
+        // four bytes of a nine-byte file.
+        let cut = 512 + 512 + 512 + 4;
+        let mut archive = tar::Archive::new(Cursor::new(&tar_bytes[..cut]));
+        let mut renamed = Vec::new();
+        let result = unpack_tar_tree(
+            &mut archive,
+            &dir,
+            false,
+            true,
+            &SilentReporter,
+            &mut renamed,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(dir.join("first.txt")).unwrap(), b"complete");
+        assert!(
+            !dir.join("second.txt").exists(),
+            "the entry the cut interrupted must not be kept"
+        );
+        // The name is still reported, but the commit step skips a top-level entry
+        // that staging does not have.
+        assert_eq!(result.tops.len(), 2);
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3824,13 +4757,69 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_bytes_are_located() {
-        assert_eq!(first_non_ascii(b"plain"), None);
-        assert_eq!(first_non_ascii(b""), None);
-        // "héllo": the first byte of the two-byte UTF-8 sequence.
-        assert_eq!(first_non_ascii(b"h\xc3\xa9llo"), Some((1, 0xC3)));
-        assert_eq!(first_non_ascii("pässword".as_bytes()), Some((1, 0xC3)));
-        assert_eq!(first_non_ascii(b"\xff"), Some((0, 0xFF)));
+    fn passwords_are_nfc_normalized() {
+        // ASCII is untouched, which is what keeps every older archive readable.
+        assert_eq!(*normalized_password("correcthorse"), "correcthorse");
+        // Composed and decomposed spellings of the same text are one password...
+        assert_eq!(
+            *normalized_password("pässwörd12"),
+            *normalized_password("pa\u{308}sswo\u{308}rd12")
+        );
+        // ... but NFC does not do NFKC's job: a compatibility character stays.
+        assert_ne!(
+            *normalized_password("ｐässwörd12"),
+            *normalized_password("pässwörd12")
+        );
+        assert_ne!(*normalized_password("ﬁsh"), *normalized_password("fish"));
+    }
+
+    /// An archive written with a password in a form NFC would change still opens:
+    /// the spelling exactly as typed is tried when the normalized one does not
+    /// authenticate. Only the library could ever have written one — the CLI refused
+    /// non-ASCII — so the file is built here rather than by a round trip.
+    #[cfg(feature = "test-kdf")]
+    #[test]
+    fn an_archive_written_with_an_unnormalized_password_still_opens() {
+        let dir = scratch_dir("legacy-password");
+
+        // A one-entry tar, compressed the way the encrypt pipeline would.
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_size(5);
+            header.set_path("src/a.txt").unwrap();
+            header.set_cksum();
+            builder.append(&header, &b"hello"[..]).unwrap();
+            builder.into_inner().unwrap();
+        }
+        let compressed = zstd::bulk::compress(&tar_bytes, 1).unwrap();
+
+        // Keys from the password exactly as typed: decomposed, so NFC rewrites it.
+        let typed = "pa\u{308}ssword12";
+        assert_ne!(*normalized_password(typed), typed);
+        let salt = [0x5a; SALT_SIZE];
+        let keys = derive_keys(typed, &salt).unwrap();
+
+        let mut bytes = Vec::new();
+        write_header(&mut bytes, true, b"src", &salt, &keys.header[..]).unwrap();
+        write_chunk_frame(&mut bytes, &keys.data[..], 0, &compressed).unwrap();
+        write_trailer(&mut bytes, &keys.data[..], 1).unwrap();
+        let path = dir.join("legacy.crypt");
+        fs::write(&path, bytes).unwrap();
+
+        // The same spelling typed again: the normalized attempt misses, and the
+        // retry with the password as given hits the key the old build derived.
+        let dest = dir.join("out");
+        fs::create_dir_all(&dest).unwrap();
+        let created = decrypt_file(&path, typed, Some(&dest), &DecryptOptions::default())
+            .expect("an archive keyed on the un-normalized spelling must still open");
+        assert_eq!(created.paths.len(), 1);
+        assert_eq!(fs::read(dest.join("src/a.txt")).unwrap(), b"hello");
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3841,10 +4830,27 @@ mod tests {
         assert!(err.to_string().contains("at least 8"), "{err}");
         assert!(validate_password_for_encrypt("12345678").is_ok());
 
-        // Non-ASCII and control characters are refused with a reason.
-        assert!(validate_password_for_encrypt("pässword").is_err());
+        // Any script is welcome, spaces included.
+        assert!(validate_password_for_encrypt("pässwörd").is_ok());
+        assert!(validate_password_for_encrypt("пароль-123").is_ok());
+        assert!(validate_password_for_encrypt("correct horse").is_ok());
+        assert!(validate_password_for_encrypt("😀😀😀😀😀😀😀😀").is_ok());
+
+        // What a person cannot see or retype is not.
         assert!(validate_password_for_encrypt("pass\tword").is_err());
         assert!(validate_password_for_encrypt("pass\nword").is_err());
+        let err = validate_password_for_encrypt("pass\u{7}word").unwrap_err();
+        assert!(err.to_string().contains("control"), "{err}");
+        // A zero-width space and a right-to-left override are invisible.
+        let err = validate_password_for_encrypt("pass\u{200b}word").unwrap_err();
+        assert!(err.to_string().contains("invisible"), "{err}");
+        assert!(validate_password_for_encrypt("pass\u{202e}word").is_err());
+        // So is a non-breaking space: only a plain space is allowed.
+        let err = validate_password_for_encrypt("pass\u{a0}word").unwrap_err();
+        assert!(err.to_string().contains("plain space"), "{err}");
+
+        // Decrypting accepts anything, which is what keeps old archives open.
+        assert!(validate_password_for_encrypt("short").is_err());
     }
 
     #[test]
@@ -3858,6 +4864,9 @@ mod tests {
             parsed.zstd_compression_level,
             DEFAULT_ZSTD_COMPRESSION_LEVEL
         );
+        // Names are restored byte for byte unless the file says otherwise.
+        assert!(!parsed.compat);
+        assert_eq!(parsed.compat, Config::default().compat);
     }
 
     #[test]
@@ -3884,6 +4893,7 @@ mod tests {
             "--level=3",
             "--output",
             "out",
+            "--compat",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -3894,6 +4904,11 @@ mod tests {
         assert_eq!(cli.workers, Some(2));
         assert_eq!(cli.level, Some(3));
         assert_eq!(cli.output, Some(PathBuf::from("out")));
+        assert!(cli.compat, "--compat is a switch");
+        assert!(
+            !parse_cli(&["-d".to_string()]).unwrap().compat,
+            "off by default"
+        );
 
         // `--` makes a leading dash a path.
         let args: Vec<String> = ["-d", "--", "-weird-name"]
@@ -4013,7 +5028,8 @@ mod tests {
         assert!(matches!(err, Error::Malformed(_)), "{err:?}");
 
         // A request that cannot be honoured never reaches the KDF.
-        let err = encrypt_file(&[], "correcthorse", None, &EncryptOptions::default()).unwrap_err();
+        let none: &[PathBuf] = &[];
+        let err = encrypt_file(none, "correcthorse", None, &EncryptOptions::default()).unwrap_err();
         assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     }
 
@@ -4036,6 +5052,8 @@ mod tests {
                 workers: DEFAULT_NUM_WORKERS,
                 partial: false,
                 legacy_kdf: BUILT_IN_KDF,
+                compat: false,
+                reporter: None,
             }
         );
     }

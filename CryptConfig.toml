@@ -1,6 +1,9 @@
 # IMPORTANT NOTES:
-# crypt only accepts printable ASCII passwords.
-# Use a password over at least 8 characters.
+# This file is read by the crypt command line tool only; the library entry
+# points (crypt::encrypt_file and crypt::decrypt_file) do not look for it.
+# crypt accepts passwords in any script and NFC-normalizes them before hashing;
+# control characters, invisible format characters and whitespace other than a
+# plain space are refused. Use a password over at least 8 characters.
 # CryptConfig is looked up in $CRYPT_CONFIG, then
 # $XDG_CONFIG_HOME/crypt/CryptConfig.toml (usually ~/.config/crypt/), then next to
 # the binary. If none exists, this file is written to the first of those places.
@@ -19,6 +22,13 @@ argon2_parallelism = 2
 # Zstd compression level (1-22), 19+ is recommended.
 # --level <n> CLI flag. Values outside 1-22 are clamped.
 zstd_compression_level = 22
+
+# Restore names the exFAT/Win32 way when decrypting: characters those
+# filesystems refuse (< > : " | ? * \ and control characters) become '_', and a
+# name that is already taken gets a '_1', '_2' suffix instead of being written
+# over. Off by default, where names come back byte for byte.
+# --compat CLI flag forces it on. No effect when encrypting.
+compat = false
 
 
 # Encrypt Example:

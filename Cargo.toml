@@ -2,7 +2,7 @@
 name = "crypt"
 version = "2.0.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.78"
 description = "Store large amounts of data in one .crypt file."
 license = "GPL-3.0-only"
 repository = "https://github.com/SavageDuck26/crypt"
@@ -17,6 +17,9 @@ test-kdf = []
 [dependencies]
 argon2 = "0.5.3"
 aes-gcm = "0.10.3"
+# NFC for passwords: canonical equivalence only (composed vs decomposed), so the
+# same visible password derives the same key on any keyboard.
+unicode-normalization = "0.1.26"
 walkdir = "2.5.0"
 tar = "0.4.46"
 filetime = "0.2"
@@ -41,11 +44,15 @@ strip = "symbols"
 # handling are exactly where it would be least welcome.
 unsafe_code = "forbid"
 # Every public item carries a doc comment; the library is meant to be usable.
-missing_docs = "warn"
+missing_docs = "deny"
 
 [lints.clippy]
 # Nothing half-finished should be able to reach a release build.
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
+
+[lints.rustdoc]
+# The docs are part of the crate's usability, so a broken link is a build error.
+broken_intra_doc_links = "deny"
 
