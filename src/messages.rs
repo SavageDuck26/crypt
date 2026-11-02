@@ -174,24 +174,10 @@ pub(crate) mod err {
 
     /// Chunks can only be written in order; a gap would be an archive that looks
     /// complete and is not.
-    pub fn chunks_out_of_order(pending: usize) -> String {
-        format!(
-            "{pending} chunks arrived out of order and could not be written; the stream would \
-             contain a gap"
-        )
-    }
-
     pub fn chunk_gap(lowest: u64, pending: usize) -> String {
         format!(
             "chunk {lowest} (and {pending} after it) could not be written; the stream would \
              contain a gap"
-        )
-    }
-
-    pub fn chunks_out_of_order_output(pending: usize) -> String {
-        format!(
-            "{pending} chunks arrived out of order and could not be written; the output would be \
-             incomplete"
         )
     }
 

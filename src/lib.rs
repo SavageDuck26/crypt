@@ -2585,16 +2585,49 @@ fn create_coffin(base_dir: &Path, stem: &OsStr) -> Result<(PathBuf, BufWriter<Fi
     Err(Error::other(err::no_free_output_name(base_dir)))
 }
 
+/// How many chunks may be read ahead of the one being written.
+///
+/// The reader takes a credit from a bounded channel before it reads a chunk and
+/// the writer returns one once that chunk is written, so the number of chunks
+/// waiting in the reorder buffer has a hard ceiling. Four chunks per worker (at
+/// least eight) keeps the pipeline fed without the buffer growing with the size
+/// of the archive.
+fn reorder_window(workers: usize) -> usize {
+    (workers * 4).max(8)
+}
+
+/// Fill a credit channel with `window` permits.
+///
+/// The initial permits let the producer read the first `window` chunks; after
+/// that every permit it uses has to come back from the writer.
+fn seed_credits(
+    window: usize,
+) -> (
+    crossbeam_channel::Sender<()>,
+    crossbeam_channel::Receiver<()>,
+) {
+    let (credits_tx, credits_rx) = crossbeam_channel::bounded::<()>(window);
+    for _ in 0..window {
+        // The channel has room for exactly `window` values and nobody has
+        // received one yet, so these cannot fail.
+        let _ = credits_tx.send(());
+    }
+    (credits_tx, credits_rx)
+}
+
 /// Encrypt every chunk from `rx` in index order.
 ///
-/// Returns how many chunks were written *contiguously*. A gap stops the loop
-/// with an error instead of silently sealing a short stream: the trailer would
-/// otherwise certify an incomplete archive as complete.
+/// Returns how many chunks were written *contiguously*. A missing chunk is
+/// detected only after the producer has closed the channel: while the stream is
+/// still running, an index that has not arrived yet is a worker that has not
+/// finished, not a hole. The writer returns one of the `credits` after each
+/// chunk, which is what stops the reader from running further and further ahead
+/// of a slow compressor.
 fn write_all_chunks<W: Write>(
     out: &mut W,
     key: &[u8],
     rx: crossbeam_channel::Receiver<CompressedChunk>,
-    max_pending: usize,
+    credits: crossbeam_channel::Sender<()>,
 ) -> Result<u64> {
     let mut pending: HashMap<u64, CompressedChunk> = HashMap::new();
     let mut next_index: u64 = 0;
@@ -2604,9 +2637,10 @@ fn write_all_chunks<W: Write>(
         while let Some(chunk) = pending.remove(&next_index) {
             write_chunk_frame(out, key, chunk.index, &chunk.compressed)?;
             next_index += 1;
-        }
-        if pending.len() > max_pending {
-            return Err(Error::other(err::chunks_out_of_order(pending.len())));
+            // The reader waits for this before it reads another chunk. A send
+            // failure means the reader is already gone, which is not an error:
+            // whichever side stopped first owns the only interesting error.
+            let _ = credits.send(());
         }
     }
 
@@ -2778,6 +2812,11 @@ pub fn encrypt_file<P: AsRef<Path>>(
 
     let (raw_tx, raw_rx) = crossbeam_channel::bounded::<RawChunk>(workers);
     let (compressed_tx, compressed_rx) = crossbeam_channel::bounded::<CompressedChunk>(workers * 2);
+    // The reorder window is enforced by credits: the reader takes one before
+    // each chunk and the writer returns one after the chunk is on disk. A worker
+    // that is slower than the rest therefore stalls the reader instead of
+    // letting the writer's pending map grow to the size of the archive.
+    let (credit_tx, credit_rx) = seed_credits(reorder_window(workers));
 
     let progress = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
@@ -2794,6 +2833,12 @@ pub fn encrypt_file<P: AsRef<Path>>(
         let mut chunk_data = Zeroizing::new(vec![0u8; CHUNK_SIZE]);
 
         loop {
+            // Wait for a free slot in the reorder window before doing more
+            // work. If the writer is gone its error is the interesting one, so
+            // there is nothing to report here.
+            if credit_rx.recv().is_err() {
+                break;
+            }
             let mut offset = 0usize;
             loop {
                 match pipe_buf.read(&mut chunk_data[offset..]) {
@@ -2879,12 +2924,8 @@ pub fn encrypt_file<P: AsRef<Path>>(
     // instead of waiting on a channel nobody is reading.
     drop(raw_rx);
 
-    let written = match write_all_chunks(
-        &mut output_file,
-        &keys.data[..],
-        compressed_rx,
-        (workers * 4).max(8),
-    ) {
+    let written = match write_all_chunks(&mut output_file, &keys.data[..], compressed_rx, credit_tx)
+    {
         Ok(count) => Some(count),
         Err(e) => {
             first_error.get_or_insert(e);
@@ -3291,6 +3332,10 @@ pub fn decrypt_file(
         os_pipe::pipe().map_err(|e| Error::io(err::cannot_create_pipe(&e), &e))?;
     let (compressed_tx, compressed_rx) = crossbeam_channel::bounded::<CompressedReadChunk>(workers);
     let (decrypted_tx, decrypted_rx) = crossbeam_channel::bounded::<DecryptedChunk>(workers * 2);
+    // As on the encrypt side: the chunk reader takes a credit before reading
+    // each frame and the pipe writer returns one after the chunk is written. A
+    // slow decompressor is backpressure, not a gap in the stream.
+    let (credit_tx, credit_rx) = seed_credits(reorder_window(workers));
 
     let progress = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
@@ -3314,6 +3359,11 @@ pub fn decrypt_file(
 
         let mut index: u64 = 0;
         loop {
+            // Wait for a free slot in the reorder window before reading more.
+            // A disconnected writer means the operation is already stopping.
+            if credit_rx.recv().is_err() {
+                break;
+            }
             let frame =
                 match read_chunk_frame(&mut reader, &data_key[..], index, allow_legacy_trailer) {
                     Ok(frame) => frame,
@@ -3395,7 +3445,6 @@ pub fn decrypt_file(
         let mut pipe_buf = BufWriter::with_capacity(8 * 1024 * 1024, raw_pipe_writer);
         let mut next_index: u64 = 0;
         let mut pending: HashMap<u64, DecryptedChunk> = HashMap::new();
-        let max_pending = (workers * 4).max(8);
 
         while let Ok(chunk) = decrypted_rx.recv() {
             pending.insert(chunk.index, chunk);
@@ -3404,9 +3453,9 @@ pub fn decrypt_file(
                     .write_all(&chunk.data)
                     .map_err(|e| Error::io(err::cannot_write_stream(&e), &e))?;
                 next_index += 1;
-            }
-            if pending.len() > max_pending {
-                return Err(Error::other(err::chunks_out_of_order_output(pending.len())));
+                // Let the chunk reader fetch another frame; a send failure
+                // means it has already stopped, which is not an error here.
+                let _ = credit_tx.send(());
             }
         }
 
@@ -4429,6 +4478,52 @@ mod tests {
         let cut = &bytes[..bytes.len() - (4 + NONCE_SIZE + 8 + GCM_TAG_SIZE) - 5];
         let err = read_chunks(cut, false).unwrap_err();
         assert!(err.to_string().contains("incomplete"), "{err}");
+    }
+
+    #[test]
+    fn a_late_chunk_is_a_wait_not_a_gap() {
+        // A full reorder buffer used to be treated as evidence of corruption, so
+        // one slow compressor after 32 finished chunks failed a whole archive
+        // with "33 chunks arrived out of order". A chunk that has not arrived
+        // yet is just late; only a closed stream with chunks still pending is a
+        // real gap.
+        let (chunks_tx, chunks_rx) = crossbeam_channel::bounded::<CompressedChunk>(64);
+        let (credits_tx, credits_rx) = crossbeam_channel::unbounded();
+
+        // Index 0 is the chunk the slow worker is still holding; the 33 after
+        // it have already come back from the faster workers.
+        for index in 1..=33u64 {
+            chunks_tx
+                .send(CompressedChunk {
+                    index,
+                    compressed: Zeroizing::new(vec![index as u8]),
+                })
+                .unwrap();
+        }
+        chunks_tx
+            .send(CompressedChunk {
+                index: 0,
+                compressed: Zeroizing::new(vec![0]),
+            })
+            .unwrap();
+        drop(chunks_tx);
+        // The writer only needs somewhere to return credits; the real pipeline
+        // drains them, and this test is about the write side's verdict.
+        drop(credits_rx);
+
+        let mut out = Vec::new();
+        let written = write_all_chunks(&mut out, &DK, chunks_rx, credits_tx).unwrap();
+        assert_eq!(written, 34);
+
+        let mut cursor = Cursor::new(&out);
+        for index in 0..34u64 {
+            match read_chunk_frame(&mut cursor, &DK, index, false).unwrap() {
+                ChunkFrame::Data { plaintext } => {
+                    assert_eq!(&plaintext[..], &[index as u8]);
+                }
+                ChunkFrame::End { .. } => panic!("the writer must not append a trailer"),
+            }
+        }
     }
 
     #[test]
